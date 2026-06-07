@@ -16,9 +16,11 @@ Usage:
 
 import argparse
 import calendar
+import concurrent.futures
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -211,6 +213,7 @@ def extract_timestamps(jsonl_path):
     timestamps = []
     token_events = []
     summary = None
+    title = None  # latest Claude Code auto-generated session title (ai-title record)
     skipped = 0
 
     try:
@@ -226,6 +229,15 @@ def extract_timestamps(jsonl_path):
                     continue
 
                 rec_type = record.get("type")
+
+                # Session title: Claude Code writes successive `ai-title` records
+                # as the topic is refined; keep the last non-empty one.
+                if rec_type == "ai-title":
+                    at = record.get("aiTitle")
+                    if at:
+                        title = at.strip()
+                    continue
+
                 if rec_type not in ("user", "assistant"):
                     continue
 
@@ -258,6 +270,7 @@ def extract_timestamps(jsonl_path):
     return {
         "timestamps": sorted(timestamps),
         "summary": summary,
+        "title": title,
         "token_events": token_events,
     }
 
@@ -315,6 +328,92 @@ def aggregate_tokens(token_events):
 
     overall["total"] = sum(overall[k] for k in TOKEN_KEYS)
     return {"families": fam_out, "tokens": overall, "cost": round(total_cost, 6)}
+
+
+# ── Transcript visualization (claude-code-transcripts) ───────────────────────
+
+def _transcript_tool_cmd():
+    """Return the base argv for claude-code-transcripts, or None if unavailable.
+
+    Prefers a directly-installed binary; falls back to `uvx` (which fetches and
+    caches the tool on first use). Simon Willison's claude-code-transcripts
+    converts a Claude Code JSONL session into a static multi-page HTML bundle.
+    """
+    if shutil.which("claude-code-transcripts"):
+        return ["claude-code-transcripts"]
+    if shutil.which("uvx"):
+        return ["uvx", "claude-code-transcripts"]
+    return None
+
+
+def _resolve_transcripts_base(project_paths, override):
+    """Pick the directory to write transcript bundles under.
+
+    Default: <project canonical path that exists on disk>/time-report-transcripts.
+    Prefer a path under ~/codes when several match (the user's working copy),
+    else the first existing path, else the first matched path.
+    """
+    if override:
+        return Path(override).expanduser()
+    existing = [p for p in project_paths if Path(p).is_dir()]
+    codes = [p for p in existing if "/codes/" in p]
+    chosen = (codes or existing or project_paths or [str(Path.cwd())])[0]
+    return Path(chosen) / "time-report-transcripts"
+
+
+def generate_transcripts(sessions, project_paths, override, log):
+    """Render each session's JSONL into a static HTML bundle and attach a
+    file:// link (`session["transcript"]`) pointing at its index.html.
+
+    Idempotent: a session whose bundle already exists is skipped (transcripts
+    of past sessions don't change). Returns the base output directory, or None
+    if the tool is unavailable.
+    """
+    base_cmd = _transcript_tool_cmd()
+    if not base_cmd:
+        log("  WARN: claude-code-transcripts not found and `uvx` unavailable — "
+            "skipping transcript generation. Install uv (https://docs.astral.sh/uv) "
+            "or `uv tool install claude-code-transcripts`.")
+        return None
+
+    base = _resolve_transcripts_base(project_paths, override)
+    base.mkdir(parents=True, exist_ok=True)
+    log(f"Transcripts → {base}")
+
+    targets = [s for s in sessions if s.get("jsonlPath")]
+
+    def _one(s):
+        out = base / (s.get("fullId") or s["id"])
+        index = out / "index.html"
+        if index.exists():
+            return s, index, True, None  # already generated — reuse
+        out.mkdir(parents=True, exist_ok=True)
+        # The `json` subcommand converts a single session file. (It has no
+        # --include-agents in the current tool; subagent calls still show inline
+        # as Task tool uses, just without their nested sub-transcripts.)
+        cmd = base_cmd + ["json", s["jsonlPath"], "-o", str(out)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return s, index, False, str(e)
+        if r.returncode != 0 or not index.exists():
+            return s, index, False, (r.stderr or r.stdout or "no index.html").strip()[:200]
+        return s, index, True, None
+
+    ok = failed = 0
+    # Modest parallelism — each call spawns a subprocess (releases the GIL).
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        for s, index, success, err in ex.map(_one, targets):
+            if success:
+                s["transcript"] = index.as_uri()
+                ok += 1
+            else:
+                s["transcript"] = None
+                failed += 1
+                log(f"  WARN: transcript failed for {s['id']}: {err}")
+    log(f"Transcripts: {ok}/{len(targets)} ready"
+        + (f", {failed} failed" if failed else ""))
+    return base
 
 
 def build_report_data(sessions, date_from, date_to, project_name, project_paths):
@@ -514,6 +613,13 @@ def build_parser():
     parser.add_argument("--open", action="store_true", default=True,
                         help="Auto-open report in browser (default)")
     parser.add_argument("--no-open", action="store_true", help="Don't auto-open report")
+    parser.add_argument("--transcripts", action="store_true",
+                        help="Render each in-range session into a static HTML "
+                             "transcript (via claude-code-transcripts) and link "
+                             "it from the Title column of the cost table.")
+    parser.add_argument("--transcripts-dir",
+                        help="Override the transcript output directory "
+                             "(default: <project path>/time-report-transcripts).")
     return parser
 
 
@@ -614,6 +720,8 @@ def main():
 
         sessions.append({
             "id": external_id[:8],
+            "fullId": external_id,
+            "title": result.get("title") or "",
             "summary": result["summary"] or f"(session {external_id[:8]})",
             "branch": branch,
             "messageCount": msg_count or len(ts_in_range),
@@ -622,6 +730,8 @@ def main():
             "tokens": usage["tokens"],
             "cost": usage["cost"],
             "families": usage["families"],
+            "jsonlPath": jsonl_path,
+            "transcript": None,
         })
 
     log(f"Sessions with data: {len(sessions)}")
@@ -649,6 +759,10 @@ def main():
                                         "dateRange": {"from": str(date_from), "to": str(date_to)}},
                                "sessions": []}, indent=2))
         sys.exit(0)
+
+    # Optionally render per-session transcript bundles and link them in the table
+    if args.transcripts:
+        generate_transcripts(sessions, project_paths, args.transcripts_dir, log)
 
     # Build report data
     project_display = _get_project_name(project_paths[0]) if project_paths else project_keyword

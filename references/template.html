@@ -112,7 +112,11 @@
   .cost-pager button:hover:not(:disabled) { border-color: #1a73e8; color: #1a73e8; }
   .cost-pager button:disabled { opacity: 0.4; cursor: default; }
   .cost-table td { font-size: 12.5px; padding: 8px 12px; border-bottom: 1px solid #f5f5f5; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .cost-table td.desc { text-align: left; color: #444; max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cost-table td.desc { text-align: left; color: #444; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cost-table td.title { text-align: left; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cost-table td.title a { color: #1a73e8; text-decoration: none; }
+  .cost-table td.title a:hover { text-decoration: underline; }
+  .cost-table td.title .plain { color: #555; }
   .cost-table tr:hover td { background: #f8f9fb; }
   .cost-table tfoot td { font-weight: 700; border-top: 2px solid #eee; border-bottom: none; color: #1a73e8; }
   .cost-table .cost-val { color: #d93025; font-weight: 600; }
@@ -193,7 +197,8 @@
       <thead>
         <tr>
           <th class="l sortable" data-sort="start">Started<span class="arrow"></span></th>
-          <th class="l">Session</th>
+          <th class="l">Title</th>
+          <th class="l">Summary</th>
           <th class="sortable" data-sort="msgs">Messages<span class="arrow"></span></th>
           <th class="sortable" data-sort="input">Input<span class="arrow"></span></th>
           <th class="sortable" data-sort="output">Output<span class="arrow"></span></th>
@@ -325,6 +330,11 @@ function fmtTokens(n) {
 function fmtCost(usd) {
   return '$' + (usd || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 
 // ========== RENDER: TOKEN + COST TABLE (threshold-independent) ==========
 const COST_PAGE_SIZE = 15;
@@ -347,6 +357,8 @@ function buildCostRows() {
       return {
         start,
         when: String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0') + ' ' + formatTsTime(start),
+        title: s.title || s.summary || ('session ' + s.id.slice(0, 8)),
+        transcript: s.transcript || null,
         desc: s.summary || ('(session ' + s.id.slice(0, 8) + ')'),
         msgs: s.messageCount || 0,
         input, output, cw, cr,
@@ -378,22 +390,26 @@ function drawCostTable() {
   if (costPage < 0) costPage = 0;
   const slice = sorted.slice(costPage * COST_PAGE_SIZE, (costPage + 1) * COST_PAGE_SIZE);
 
-  document.getElementById('cost-body').innerHTML = slice.map(r =>
-    '<tr>' +
-    '<td class="l" style="color:#666;">' + r.when + '</td>' +
-    '<td class="desc" title="' + r.desc.replace(/"/g, '&quot;') + '">' + r.desc + '</td>' +
-    '<td>' + r.msgs + '</td>' +
-    '<td>' + fmtTokens(r.input) + '</td>' +
-    '<td>' + fmtTokens(r.output) + '</td>' +
-    '<td>' + fmtTokens(r.cw) + '</td>' +
-    '<td>' + fmtTokens(r.cr) + '</td>' +
-    '<td>' + fmtTokens(r.total) + '</td>' +
-    '<td class="cost-val">' + fmtCost(r.cost) + '</td>' +
-    '</tr>'
-  ).join('');
+  document.getElementById('cost-body').innerHTML = slice.map(r => {
+    const titleCell = r.transcript
+      ? '<a href="' + esc(r.transcript) + '" target="_blank" rel="noopener">' + esc(r.title) + '</a>'
+      : '<span class="plain">' + esc(r.title) + '</span>';
+    return '<tr>' +
+      '<td class="l" style="color:#666;">' + r.when + '</td>' +
+      '<td class="title" title="' + esc(r.title) + '">' + titleCell + '</td>' +
+      '<td class="desc" title="' + esc(r.desc) + '">' + esc(r.desc) + '</td>' +
+      '<td>' + r.msgs + '</td>' +
+      '<td>' + fmtTokens(r.input) + '</td>' +
+      '<td>' + fmtTokens(r.output) + '</td>' +
+      '<td>' + fmtTokens(r.cw) + '</td>' +
+      '<td>' + fmtTokens(r.cr) + '</td>' +
+      '<td>' + fmtTokens(r.total) + '</td>' +
+      '<td class="cost-val">' + fmtCost(r.cost) + '</td>' +
+      '</tr>';
+  }).join('');
 
   document.getElementById('cost-foot').innerHTML = '<tr>' +
-    '<td class="l">TOTAL (all ' + costRows.length + ')</td><td></td>' +
+    '<td class="l">TOTAL (all ' + costRows.length + ')</td><td></td><td></td>' +
     '<td>' + costTotals.msgs + '</td>' +
     '<td>' + fmtTokens(costTotals.input) + '</td>' +
     '<td>' + fmtTokens(costTotals.output) + '</td>' +

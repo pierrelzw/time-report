@@ -1,7 +1,7 @@
 ---
 name: time-report
 description: 生成 Claude Code 会话时间的交互式 HTML 甘特图报告。用法：/time-report <project> <month|from to> 或 /time-report --list
-version: 3.2.0
+version: 3.3.0
 tools: Bash, mcp__cccmemory__index_all_projects
 ---
 
@@ -30,6 +30,19 @@ mcp__cccmemory__index_all_projects(incremental=true)
 python3 {baseDir}/scripts/time-report.py $ARGUMENTS --open
 ```
 
+**Transcript visualization (opt-in).** If the user's request mentions transcripts or
+session visualization — e.g. "transcript(s)", "可视化", "会话可视化", "看会话内容",
+"view sessions", "session viewer" — append `--transcripts`:
+```bash
+python3 {baseDir}/scripts/time-report.py <project> <range> --transcripts --open
+```
+This renders every in-range session into a static HTML bundle via
+`claude-code-transcripts` (run through `uvx`; the tool is fetched/cached on first use)
+and turns the **Title** column of the cost table into a link to each session's
+transcript. Bundles are written to `<project path>/time-report-transcripts/<session-id>/`
+by default (override with `--transcripts-dir DIR`); generation is idempotent
+(existing bundles are reused). Requires `uv`/`uvx` on PATH.
+
 If the script reports an error, display the error message to the user.
 
 ## Output
@@ -37,7 +50,7 @@ If the script reports an error, display the error message to the user.
 The skill produces an interactive HTML report (written to `/tmp/time-report-<project>-<range>.html`) and opens it in the default browser (the `--open` flag handles this). It has two parts:
 
 1. **Gantt chart** — each session as a horizontal bar on a per-day timeline, with hover tooltips and click-to-expand detail.
-2. **Token Usage & Cost table** — one row per session with industry-named columns (Started, Session, Messages, Input, Output, Cache Write, Cache Read, Total, Cost) and an API-equivalent USD cost, plus stat cards for total tokens and total cost. A glossary above the table explains each column. Click any numeric/time column header to sort (default: **Total tokens, descending**; time sorts ascending, amounts descending). Tables longer than 15 rows paginate; the TOTAL footer always reflects the full dataset, not the current page.
+2. **Token Usage & Cost table** — one row per session with columns: Started, **Title**, **Summary**, Messages, Input, Output, Cache Write, Cache Read, Total, Cost. Title is the session's auto-generated `aiTitle` (falls back to the first-prompt summary); with `--transcripts` it links to that session's rendered transcript. Summary is the first user message. Numeric/time columns are sortable (default: **Total tokens, descending**); tables longer than 15 rows paginate, and the TOTAL footer always reflects the full dataset. A glossary below the table explains the pricing logic.
 
 The terminal also prints a text summary (active time, total tokens, estimated cost, per-model cost breakdown) followed by a **per-session table report** with the same token/cost columns.
 
