@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code Time Report</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f7fa; color: #333; padding: 40px; }
+  .container { max-width: 1400px; margin: 0 auto; }
+  h1 { font-size: 22px; font-weight: 600; margin-bottom: 6px; }
+  .subtitle { color: #666; font-size: 14px; margin-bottom: 30px; }
+  .stats { display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 32px; }
+  .stat-card { background: #fff; border-radius: 10px; padding: 18px 24px; flex: 1; min-width: 150px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .stat-card .sub { font-size: 11px; color: #aaa; margin-top: 4px; }
+  .stat-card .label { font-size: 12px; color: #888; margin-bottom: 4px; }
+  .stat-card .value { font-size: 28px; font-weight: 700; color: #1a73e8; }
+  .stat-card .unit { font-size: 14px; color: #666; font-weight: 400; }
+
+  .filter-bar { background: #fff; border-radius: 12px; padding: 16px 28px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 16px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .filter-label { font-size: 14px; font-weight: 500; color: #333; }
+  .filter-slider-wrap { display: flex; align-items: center; gap: 10px; flex: 1; max-width: 400px; }
+  .filter-slider { -webkit-appearance: none; appearance: none; flex: 1; height: 6px; border-radius: 3px; background: #e0e0e0; outline: none; }
+  .filter-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 20px; height: 20px; border-radius: 50%; background: #1a73e8; cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,0.2); }
+  .filter-value { font-size: 20px; font-weight: 700; color: #1a73e8; min-width: 60px; text-align: center; }
+  .filter-presets { display: flex; gap: 6px; }
+  .filter-preset { padding: 4px 12px; border-radius: 16px; border: 1px solid #ddd; background: #fff; font-size: 12px; color: #666; cursor: pointer; transition: all 0.15s; }
+  .filter-preset:hover { border-color: #1a73e8; color: #1a73e8; }
+  .filter-preset.active { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+
+  .gantt-wrapper { background: #fff; border-radius: 12px; padding: 28px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 24px; }
+  .gantt-title { font-size: 16px; font-weight: 600; margin-bottom: 20px; }
+
+  .timeline-header { display: flex; margin-left: 90px; margin-right: 180px; margin-bottom: 2px; position: relative; height: 20px; }
+  .timeline-tick { position: absolute; font-size: 11px; color: #aaa; transform: translateX(-50%); }
+
+  .day-row { border-bottom: 1px solid #f0f0f0; cursor: pointer; transition: background 0.15s; }
+  .day-row:last-child { border-bottom: none; }
+  .day-row:hover { background: #fafbfc; }
+  .day-main { display: flex; align-items: center; min-height: 56px; position: relative; }
+  .day-label { width: 90px; flex-shrink: 0; padding: 10px 0; }
+  .day-label .date { font-size: 14px; font-weight: 600; }
+  .day-label .day { font-size: 12px; color: #888; }
+  .day-label .total { font-size: 11px; color: #1a73e8; font-weight: 500; margin-top: 2px; }
+
+  .timeline-area { flex: 1; position: relative; height: 44px; }
+  .timeline-grid { position: absolute; top: 0; left: 0; right: 0; bottom: 0; pointer-events: none; }
+  .timeline-grid-line { position: absolute; top: 0; bottom: 0; width: 1px; border-left: 1px dashed #f0f0f0; }
+
+  .session-span { position: absolute; height: 32px; top: 6px; border-radius: 3px; cursor: pointer; transition: opacity 0.15s, transform 0.15s; min-width: 2px; }
+  .session-span:hover { opacity: 0.85; transform: scaleY(1.15); z-index: 10; }
+
+  .intra-gap { position: absolute; height: 32px; top: 6px; pointer-events: none;
+    background: repeating-linear-gradient(45deg, transparent, transparent 2px, rgba(0,0,0,0.04) 2px, rgba(0,0,0,0.04) 4px); }
+
+  .gap-block { position: absolute; height: 32px; top: 6px; border-radius: 2px; pointer-events: none; }
+  .gap-block.included { background: rgba(52, 168, 83, 0.12); border: 1px dashed rgba(52, 168, 83, 0.3); }
+  .gap-block.excluded { background: repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(234,67,53,0.06) 3px, rgba(234,67,53,0.06) 6px); }
+
+  .tooltip { display: none; position: absolute; background: #333; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 12px; line-height: 1.5; white-space: nowrap; z-index: 100; pointer-events: none; bottom: 100%; left: 50%; transform: translateX(-50%); margin-bottom: 6px; }
+  .tooltip::after { content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); border: 5px solid transparent; border-top-color: #333; }
+  .session-span:hover .tooltip { display: block; }
+
+  .day-summary { width: 180px; flex-shrink: 0; padding: 4px 8px; font-size: 11px; color: #888; line-height: 1.4; text-align: left; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+  .toggle-arrow { position: absolute; right: 188px; top: 50%; transform: translateY(-50%); font-size: 12px; color: #bbb; transition: transform 0.2s; }
+  .day-row.open .toggle-arrow { transform: translateY(-50%) rotate(90deg); }
+
+  .day-detail { max-height: 0; overflow: hidden; transition: max-height 0.3s ease; }
+  .day-row.open .day-detail { max-height: 4000px; }
+  .detail-inner { padding: 0 12px 16px 90px; }
+  .detail-table { width: 100%; border-collapse: collapse; }
+  .detail-table th { text-align: left; font-size: 11px; color: #999; font-weight: 500; padding: 6px 12px; border-bottom: 1px solid #eee; text-transform: uppercase; letter-spacing: 0.5px; }
+  .detail-table td { font-size: 12.5px; padding: 8px 12px; border-bottom: 1px solid #f5f5f5; vertical-align: top; }
+  .detail-table tr:last-child td { border-bottom: none; }
+  .detail-table .col-idx { width: 30px; }
+  .detail-table .col-time { width: 100px; color: #666; font-variant-numeric: tabular-nums; }
+  .detail-table .col-dur { width: 70px; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .detail-table .col-spans { width: 50px; font-variant-numeric: tabular-nums; color: #999; }
+  .detail-table .col-gap { width: 90px; font-variant-numeric: tabular-nums; }
+  .detail-table .col-desc { color: #444; line-height: 1.4; }
+  .detail-table tr:hover { background: #f8f9fb; }
+  .color-dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: middle; }
+
+  .legend { display: flex; align-items: center; gap: 16px; margin-top: 16px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 4px; font-size: 12px; color: #666; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 3px; }
+  .legend-gap-in { width: 14px; height: 14px; background: rgba(52, 168, 83, 0.15); border: 1px dashed rgba(52, 168, 83, 0.4); border-radius: 3px; }
+  .legend-gap-out { width: 14px; height: 14px; background: repeating-linear-gradient(45deg, transparent, transparent 2px, rgba(234,67,53,0.1) 2px, rgba(234,67,53,0.1) 4px); border-radius: 3px; }
+  .legend-intra { width: 14px; height: 14px; background: repeating-linear-gradient(45deg, transparent, transparent 2px, rgba(0,0,0,0.06) 2px, rgba(0,0,0,0.06) 4px); border-radius: 3px; }
+
+  .day-row.inactive { opacity: 0.5; cursor: default; }
+  .day-row.inactive:hover { background: transparent; }
+  .compress-zone { position: absolute; top: 0; bottom: 0; background: rgba(0,0,0,0.02); border-right: 1px solid #e8e8e8; }
+  .compress-label { position: absolute; font-size: 9px; color: #ccc; top: 50%; transform: translateY(-50%); text-align: center; width: 100%; pointer-events: none; }
+
+  .cost-wrapper { background: #fff; border-radius: 12px; padding: 28px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 24px; }
+  .cost-title { font-size: 16px; font-weight: 600; margin-bottom: 10px; }
+  .cost-glossary { font-size: 11.5px; color: #777; margin-top: 16px; line-height: 1.7; background: #fafbfc; border: 1px solid #f0f0f0; border-radius: 8px; padding: 10px 14px; }
+  .cost-glossary b { color: #555; font-weight: 600; }
+  .cost-glossary code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #444; background: #eef1f4; padding: 1px 5px; border-radius: 4px; }
+  .cost-glossary .sep { color: #ccc; margin: 0 6px; }
+  .cost-table { width: 100%; border-collapse: collapse; }
+  .cost-table th { text-align: right; font-size: 11px; color: #999; font-weight: 500; padding: 8px 12px; border-bottom: 2px solid #eee; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+  .cost-table th.l, .cost-table td.l { text-align: left; }
+  .cost-table th.sortable { cursor: pointer; user-select: none; }
+  .cost-table th.sortable:hover { color: #1a73e8; }
+  .cost-table th .arrow { font-size: 9px; color: #1a73e8; margin-left: 3px; }
+  .cost-table th.active { color: #1a73e8; }
+  .cost-pager { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 16px; font-size: 12px; color: #888; }
+  .cost-pager button { padding: 4px 12px; border: 1px solid #ddd; background: #fff; border-radius: 6px; cursor: pointer; font-size: 12px; color: #444; }
+  .cost-pager button:hover:not(:disabled) { border-color: #1a73e8; color: #1a73e8; }
+  .cost-pager button:disabled { opacity: 0.4; cursor: default; }
+  .cost-table td { font-size: 12.5px; padding: 8px 12px; border-bottom: 1px solid #f5f5f5; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .cost-table td.desc { text-align: left; color: #444; max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cost-table tr:hover td { background: #f8f9fb; }
+  .cost-table tfoot td { font-weight: 700; border-top: 2px solid #eee; border-bottom: none; color: #1a73e8; }
+  .cost-table .cost-val { color: #d93025; font-weight: 600; }
+
+  .footer { text-align: center; color: #aaa; font-size: 12px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1 id="title">Claude Code Time Report</h1>
+  <p class="subtitle" id="subtitle"></p>
+
+  <div class="stats">
+    <div class="stat-card">
+      <div class="label">Active Time (wall-clock)</div>
+      <div class="value" id="stat-total"></div>
+      <div class="sub">并行会话已去重,≤ 当天时长</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Time Span (first→last)</div>
+      <div class="value" id="stat-session-time"></div>
+      <div class="sub">当天首条→末条消息的跨度</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Parallel Sum</div>
+      <div class="value" id="stat-gap-time"></div>
+      <div class="sub" id="stat-parallel-sub">各会话时长相加(含重叠)</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Daily Average</div>
+      <div class="value" id="stat-avg"></div>
+      <div class="sub">活跃天平均墙钟时长</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Total Tokens</div>
+      <div class="value" id="stat-tokens"></div>
+      <div class="sub" id="stat-tokens-sub"></div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Est. API Cost</div>
+      <div class="value" id="stat-cost" style="color:#d93025;"></div>
+      <div class="sub">API-equivalent</div>
+    </div>
+  </div>
+
+  <div class="filter-bar">
+    <span class="filter-label">Gap Threshold:</span>
+    <div class="filter-slider-wrap">
+      <input type="range" class="filter-slider" id="threshold-slider" min="1" max="60" value="15">
+      <div class="filter-value" id="threshold-display"></div>
+    </div>
+    <div class="filter-presets" id="presets">
+      <button class="filter-preset" data-val="5">5m</button>
+      <button class="filter-preset" data-val="10">10m</button>
+      <button class="filter-preset active" data-val="15">15m</button>
+      <button class="filter-preset" data-val="20">20m</button>
+      <button class="filter-preset" data-val="30">30m</button>
+      <button class="filter-preset" data-val="45">45m</button>
+      <button class="filter-preset" data-val="60">60m</button>
+    </div>
+  </div>
+
+  <div class="gantt-wrapper">
+    <div class="gantt-title">Daily Session Timeline <span style="font-size:12px;color:#aaa;font-weight:400;margin-left:8px;">Hover for details, click to expand | Dynamic threshold computation</span></div>
+    <div class="timeline-header" id="timeline-header"></div>
+    <div id="gantt-body"></div>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-swatch" style="background:#4285f4;"></div>Active session span</div>
+      <div class="legend-item"><div class="legend-intra"></div>Intra-session gap (exceeds threshold)</div>
+      <div class="legend-item"><div class="legend-gap-in"></div>Inter-session gap &le; threshold (included)</div>
+      <div class="legend-item"><div class="legend-gap-out"></div>Inter-session gap &gt; threshold (excluded)</div>
+    </div>
+  </div>
+
+  <div class="cost-wrapper">
+    <div class="cost-title">Token Usage &amp; Cost by Session</div>
+    <table class="cost-table">
+      <thead>
+        <tr>
+          <th class="l sortable" data-sort="start">Started<span class="arrow"></span></th>
+          <th class="l">Session</th>
+          <th class="sortable" data-sort="msgs">Messages<span class="arrow"></span></th>
+          <th class="sortable" data-sort="input">Input<span class="arrow"></span></th>
+          <th class="sortable" data-sort="output">Output<span class="arrow"></span></th>
+          <th class="sortable" data-sort="cw">Cache Write<span class="arrow"></span></th>
+          <th class="sortable" data-sort="cr">Cache Read<span class="arrow"></span></th>
+          <th class="sortable" data-sort="total">Total<span class="arrow"></span></th>
+          <th class="sortable" data-sort="cost">Cost<span class="arrow"></span></th>
+        </tr>
+      </thead>
+      <tbody id="cost-body"></tbody>
+      <tfoot id="cost-foot"></tfoot>
+    </table>
+    <div class="cost-pager" id="cost-pager"></div>
+    <div class="cost-glossary">
+      <b>计价</b>(以 Opus 为例,$/百万 token):<code>Cost = (Input&times;5 + Output&times;25 + Cache Write&times;5&times;倍率 + Cache Read&times;5&times;0.1) / 1M</code>;Cache Write 倍率 5min=1.25、1h=2;Sonnet $3/$15、Haiku $1/$5。
+      <br>
+      <b>例</b>:Input 11,392 · Output 9,176 · Cache Write(1h) 135,673 · Cache Read 857,048 → <b>$2.07</b>(codex 复核 ✓)。Input / Cache Read / Cache Write 为互不重叠的三类 token。
+      <br>
+      <span style="color:#aaa;">估算值,非订阅实际扣费 · 参考 <a href="https://www.anthropic.com/pricing#api" target="_blank" rel="noopener" style="color:#1a73e8;">API 定价</a> / <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching" target="_blank" rel="noopener" style="color:#1a73e8;">缓存计费</a></span>
+    </div>
+  </div>
+
+  <p class="footer" id="footer"></p>
+</div>
+
+<script>
+const DATA = __DATA_PLACEHOLDER__;
+
+// ========== SESSION COLORS ==========
+const SESSION_COLORS = [
+  '#4285f4','#34a853','#ea4335','#fbbc04','#9c27b0',
+  '#00acc1','#ff7043','#5c6bc0','#43a047','#e91e63',
+  '#00897b','#f4511e','#3949ab','#c0ca33','#8e24aa',
+  '#039be5','#d81b60','#7cb342','#6d4c41','#546e7a',
+  '#ef6c00','#1e88e5','#ab47bc','#fdd835','#26a69a',
+];
+
+// ========== TIMEZONE HELPERS ==========
+const localOffset = new Date().getTimezoneOffset() * -60000; // ms offset from UTC
+
+function tsToMinOfDay(ts) {
+  const d = new Date(ts);
+  return d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60;
+}
+
+function getLocalDateStr(ts) {
+  const d = new Date(ts);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+function getDateBounds(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const start = new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
+  return [start, start + 86400000];
+}
+
+// ========== TIME AXIS: NON-PROPORTIONAL ==========
+const COMPRESS_HOUR = 8; // compress 0:00-8:00 into narrow zone
+const COMPRESS_WIDTH = 0.04; // 4% of width
+
+function minToPercent(min, propStart, propEnd) {
+  if (min < propStart) {
+    return (min / propStart) * COMPRESS_WIDTH * 100;
+  }
+  const propRange = propEnd - propStart;
+  return (COMPRESS_WIDTH + (1 - COMPRESS_WIDTH) * (min - propStart) / propRange) * 100;
+}
+
+// ========== CORE: COMPUTE ACTIVE SPANS ==========
+function computeActiveSpans(timestamps, thresholdMs) {
+  if (!timestamps || timestamps.length === 0) return { activeMs: 0, activeMinutes: 0, spans: [] };
+  const sorted = [...timestamps].sort((a, b) => a - b);
+  if (sorted.length === 1) return { activeMs: 0, activeMinutes: 0, spans: [{ from: sorted[0], to: sorted[0] }] };
+
+  const spans = [];
+  let spanStart = sorted[0];
+  let prev = sorted[0];
+  let activeMs = 0;
+
+  for (let i = 1; i < sorted.length; i++) {
+    const gap = sorted[i] - prev;
+    if (gap <= thresholdMs) {
+      activeMs += gap;
+    } else {
+      spans.push({ from: spanStart, to: prev });
+      spanStart = sorted[i];
+    }
+    prev = sorted[i];
+  }
+  spans.push({ from: spanStart, to: prev });
+
+  return { activeMs, activeMinutes: activeMs / 60000, spans };
+}
+
+// ========== FORMAT HELPERS ==========
+function formatDur(mins) {
+  if (mins < 1) return '<1m';
+  const h = Math.floor(mins / 60);
+  const m = Math.round(mins % 60);
+  if (h === 0) return m + 'm';
+  return h + 'h ' + m + 'm';
+}
+
+function formatDurHTML(mins) {
+  const h = Math.floor(mins / 60);
+  const m = Math.round(mins % 60);
+  return h + '<span class="unit">h</span> ' + m + '<span class="unit">m</span>';
+}
+
+function formatTime(min) {
+  const h = String(Math.floor(min) >= 0 ? Math.floor(min / 60) : 0).padStart(2, '0');
+  const m = String(Math.round(min % 60)).padStart(2, '0');
+  return h + ':' + m;
+}
+
+function formatTsTime(ts) {
+  return formatTime(tsToMinOfDay(ts));
+}
+
+const fmtWeekday = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
+
+// ========== TOKEN / COST HELPERS ==========
+function fmtTokens(n) {
+  n = n || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(Math.round(n));
+}
+function fmtCost(usd) {
+  return '$' + (usd || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// ========== RENDER: TOKEN + COST TABLE (threshold-independent) ==========
+const COST_PAGE_SIZE = 15;
+let costRows = [];
+let costTotals = null;
+let costSort = { key: 'total', dir: 'desc' }; // default: most token usage first
+let costPage = 0;
+
+function buildCostRows() {
+  const TKEYS = ['input', 'output', 'cache_read', 'cache_write_5m', 'cache_write_1h'];
+  costRows = DATA.sessions
+    .filter(s => s.timestamps && s.timestamps.length)
+    .map(s => {
+      const start = Math.min(...s.timestamps);
+      const t = s.tokens || {};
+      const input = t.input || 0, output = t.output || 0;
+      const cw = (t.cache_write_5m || 0) + (t.cache_write_1h || 0);
+      const cr = t.cache_read || 0;
+      const d = new Date(start);
+      return {
+        start,
+        when: String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0') + ' ' + formatTsTime(start),
+        desc: s.summary || ('(session ' + s.id.slice(0, 8) + ')'),
+        msgs: s.messageCount || 0,
+        input, output, cw, cr,
+        total: input + output + cw + cr,
+        cost: s.cost || 0,
+      };
+    });
+
+  // Totals are over ALL sessions, independent of paging/sort
+  costTotals = { msgs: 0, input: 0, output: 0, cw: 0, cr: 0, total: 0, cost: 0 };
+  costRows.forEach(r => {
+    costTotals.msgs += r.msgs; costTotals.input += r.input; costTotals.output += r.output;
+    costTotals.cw += r.cw; costTotals.cr += r.cr; costTotals.total += r.total; costTotals.cost += r.cost;
+  });
+
+  document.getElementById('stat-tokens').textContent = fmtTokens(costTotals.total);
+  document.getElementById('stat-tokens-sub').textContent =
+    'in ' + fmtTokens(costTotals.input) + ' · out ' + fmtTokens(costTotals.output) +
+    ' · cache ' + fmtTokens(costTotals.cw + costTotals.cr);
+  document.getElementById('stat-cost').textContent = fmtCost(costTotals.cost);
+}
+
+function drawCostTable() {
+  const dir = costSort.dir === 'asc' ? 1 : -1;
+  const sorted = [...costRows].sort((a, b) => (a[costSort.key] - b[costSort.key]) * dir);
+
+  const pages = Math.max(1, Math.ceil(sorted.length / COST_PAGE_SIZE));
+  if (costPage >= pages) costPage = pages - 1;
+  if (costPage < 0) costPage = 0;
+  const slice = sorted.slice(costPage * COST_PAGE_SIZE, (costPage + 1) * COST_PAGE_SIZE);
+
+  document.getElementById('cost-body').innerHTML = slice.map(r =>
+    '<tr>' +
+    '<td class="l" style="color:#666;">' + r.when + '</td>' +
+    '<td class="desc" title="' + r.desc.replace(/"/g, '&quot;') + '">' + r.desc + '</td>' +
+    '<td>' + r.msgs + '</td>' +
+    '<td>' + fmtTokens(r.input) + '</td>' +
+    '<td>' + fmtTokens(r.output) + '</td>' +
+    '<td>' + fmtTokens(r.cw) + '</td>' +
+    '<td>' + fmtTokens(r.cr) + '</td>' +
+    '<td>' + fmtTokens(r.total) + '</td>' +
+    '<td class="cost-val">' + fmtCost(r.cost) + '</td>' +
+    '</tr>'
+  ).join('');
+
+  document.getElementById('cost-foot').innerHTML = '<tr>' +
+    '<td class="l">TOTAL (all ' + costRows.length + ')</td><td></td>' +
+    '<td>' + costTotals.msgs + '</td>' +
+    '<td>' + fmtTokens(costTotals.input) + '</td>' +
+    '<td>' + fmtTokens(costTotals.output) + '</td>' +
+    '<td>' + fmtTokens(costTotals.cw) + '</td>' +
+    '<td>' + fmtTokens(costTotals.cr) + '</td>' +
+    '<td>' + fmtTokens(costTotals.total) + '</td>' +
+    '<td>' + fmtCost(costTotals.cost) + '</td>' +
+    '</tr>';
+
+  // Header arrows + active state
+  document.querySelectorAll('.cost-table th.sortable').forEach(th => {
+    const a = th.querySelector('.arrow');
+    if (th.dataset.sort === costSort.key) {
+      th.classList.add('active');
+      a.textContent = costSort.dir === 'asc' ? '▲' : '▼';
+    } else {
+      th.classList.remove('active');
+      a.textContent = '';
+    }
+  });
+
+  // Pager (only when more than one page)
+  const pager = document.getElementById('cost-pager');
+  if (pages <= 1) {
+    pager.innerHTML = '';
+  } else {
+    pager.innerHTML =
+      '<span>' + sorted.length + ' sessions · page ' + (costPage + 1) + ' / ' + pages + '</span>' +
+      '<button id="cost-prev"' + (costPage === 0 ? ' disabled' : '') + '>‹ Prev</button>' +
+      '<button id="cost-next"' + (costPage >= pages - 1 ? ' disabled' : '') + '>Next ›</button>';
+    document.getElementById('cost-prev').onclick = () => { costPage--; drawCostTable(); };
+    document.getElementById('cost-next').onclick = () => { costPage++; drawCostTable(); };
+  }
+}
+
+function renderCost() {
+  buildCostRows();
+  document.querySelectorAll('.cost-table th.sortable').forEach(th => {
+    th.onclick = () => {
+      const k = th.dataset.sort;
+      if (costSort.key === k) {
+        costSort.dir = costSort.dir === 'asc' ? 'desc' : 'asc';
+      } else {
+        costSort.key = k;
+        costSort.dir = (k === 'start') ? 'asc' : 'desc'; // time ascending, amounts descending
+      }
+      costPage = 0;
+      drawCostTable();
+    };
+  });
+  drawCostTable();
+}
+
+// ========== PREPROCESS: GROUP SESSIONS BY DAY ==========
+function preprocessDays(thresholdMs) {
+  // Group sessions by their first timestamp's local date
+  const dayMap = new Map();
+
+  DATA.sessions.forEach((s, sIdx) => {
+    if (!s.timestamps || s.timestamps.length === 0) return;
+    const sorted = [...s.timestamps].sort((a, b) => a - b);
+    const dateKey = getLocalDateStr(sorted[0]);
+
+    if (!dayMap.has(dateKey)) dayMap.set(dateKey, []);
+    dayMap.get(dateKey).push({
+      id: s.id,
+      desc: s.summary || '(session ' + s.id.slice(0, 8) + ')',
+      branch: s.branch || '',
+      messageCount: s.messageCount || 0,
+      timestamps: sorted,
+      globalIdx: sIdx,
+    });
+  });
+
+  // Sort days and fill inactive gaps
+  const allDates = [...dayMap.keys()].sort();
+  if (allDates.length === 0) return [];
+
+  const days = [];
+  const startDate = new Date(allDates[0] + 'T12:00:00');
+  const endDate = new Date(allDates[allDates.length - 1] + 'T12:00:00');
+
+  for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+    const dateStr = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    const shortDate = String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    const weekday = fmtWeekday.format(d);
+
+    if (dayMap.has(dateStr)) {
+      const sessions = dayMap.get(dateStr);
+      sessions.sort((a, b) => a.timestamps[0] - b.timestamps[0]);
+      days.push({ date: shortDate, fullDate: dateStr, day: weekday, sessions, inactive: false });
+    } else {
+      days.push({ date: shortDate, fullDate: dateStr, day: weekday, sessions: [], inactive: true });
+    }
+  }
+
+  return days;
+}
+
+// ========== RENDER ==========
+function render(threshold) {
+  const thresholdMs = threshold * 60 * 1000;
+  const days = preprocessDays(thresholdMs);
+
+  document.getElementById('subtitle').textContent =
+    'Threshold: ' + threshold + ' min | ' + DATA.meta.dateRange.from + ' \u2192 ' + DATA.meta.dateRange.to;
+
+  // Compute global time range for axis
+  let globalMaxMin = 0;
+  let propStart = COMPRESS_HOUR * 60;
+  days.forEach(day => {
+    day.sessions.forEach(s => {
+      const lastMin = tsToMinOfDay(s.timestamps[s.timestamps.length - 1]);
+      if (lastMin > globalMaxMin) globalMaxMin = lastMin;
+      const firstMin = tsToMinOfDay(s.timestamps[0]);
+      if (firstMin < propStart && firstMin >= COMPRESS_HOUR * 60) propStart = firstMin;
+    });
+  });
+  const propEnd = Math.ceil((globalMaxMin + 15) / 60) * 60;
+  const PROP_START = COMPRESS_HOUR * 60;
+  const PROP_END = Math.max(propEnd, PROP_START + 60);
+
+  let totalActiveUnion = 0, totalWindow = 0, totalParallelSum = 0;
+  const dayResults = [];
+
+  days.forEach(day => {
+    if (day.inactive || day.sessions.length === 0) {
+      dayResults.push({ activeUnion: 0, window: 0, parallelSum: 0, total: 0, sessionData: [] });
+      return;
+    }
+
+    const [dayStart, dayEnd] = getDateBounds(day.fullDate);
+    const sessionData = [];
+
+    day.sessions.forEach(s => {
+      // Filter timestamps to this calendar day
+      const dayTs = s.timestamps.filter(t => t >= dayStart && t < dayEnd);
+      if (dayTs.length === 0) return;
+      const result = computeActiveSpans(dayTs, thresholdMs);
+      sessionData.push({ ...s, timestamps: dayTs, ...result });
+    });
+
+    // Active time = UNION across all sessions. Sessions run in parallel, so
+    // summing per-session active time double-counts overlapping wall-clock.
+    // Merging every session's timestamps into one stream and applying the gap
+    // threshold once yields true wall-clock active time (\u2264 the day's length).
+    const combinedTs = [];
+    sessionData.forEach(s => { for (const t of s.timestamps) combinedTs.push(t); });
+    const dayActiveUnion = computeActiveSpans(combinedTs, thresholdMs).activeMinutes;
+
+    // Parallel sum = naive per-session total (can exceed 24h with concurrency)
+    let dayParallelSum = 0;
+    sessionData.forEach(s => { dayParallelSum += s.activeMinutes; });
+
+    // Wall-clock window = first \u2192 last timestamp of the day
+    let firstTs = Infinity, lastTs = -Infinity;
+    sessionData.forEach(s => {
+      firstTs = Math.min(firstTs, s.timestamps[0]);
+      lastTs = Math.max(lastTs, s.timestamps[s.timestamps.length - 1]);
+    });
+    const dayWindow = (lastTs > firstTs) ? (lastTs - firstTs) / 60000 : 0;
+
+    totalActiveUnion += dayActiveUnion;
+    totalWindow += dayWindow;
+    totalParallelSum += dayParallelSum;
+    dayResults.push({ activeUnion: dayActiveUnion, window: dayWindow, parallelSum: dayParallelSum, total: dayActiveUnion, sessionData });
+  });
+
+  // Stats
+  document.getElementById('stat-total').innerHTML = formatDurHTML(totalActiveUnion);
+  document.getElementById('stat-session-time').innerHTML = formatDurHTML(totalWindow);
+  document.getElementById('stat-gap-time').innerHTML = formatDurHTML(totalParallelSum);
+  const activeDays = days.filter(d => !d.inactive && d.sessions.length > 0).length;
+  document.getElementById('stat-parallel-sub').textContent =
+    '\u5404\u4f1a\u8bdd\u65f6\u957f\u76f8\u52a0(\u542b\u91cd\u53e0)\u00b7 ' + activeDays + ' \u6d3b\u8dc3\u5929';
+  document.getElementById('stat-avg').innerHTML = activeDays > 0 ? formatDurHTML(Math.round(totalActiveUnion / activeDays)) : '\u2014';
+
+  // Timeline header
+  const header = document.getElementById('timeline-header');
+  header.innerHTML = '';
+  const compTick = document.createElement('div');
+  compTick.className = 'timeline-tick';
+  compTick.style.left = (COMPRESS_WIDTH * 50) + '%';
+  compTick.textContent = '0-' + COMPRESS_HOUR;
+  compTick.style.fontSize = '9px';
+  compTick.style.color = '#ccc';
+  header.appendChild(compTick);
+  for (let h = COMPRESS_HOUR; h * 60 <= PROP_END; h++) {
+    const pct = minToPercent(h * 60, PROP_START, PROP_END);
+    const tick = document.createElement('div');
+    tick.className = 'timeline-tick';
+    tick.style.left = pct + '%';
+    tick.textContent = String(h).padStart(2, '0') + ':00';
+    header.appendChild(tick);
+  }
+
+  // Render days
+  const body = document.getElementById('gantt-body');
+  body.innerHTML = '';
+
+  if (days.length === 0) {
+    body.innerHTML = '<div style="text-align:center;padding:48px;color:#aaa;">No active sessions in this period</div>';
+    return;
+  }
+
+  days.forEach((day, dayIdx) => {
+    const dr = dayResults[dayIdx];
+    const row = document.createElement('div');
+    row.className = 'day-row' + (day.inactive ? ' inactive' : '');
+    if (!day.inactive && day.sessions.length > 0) row.onclick = function() { this.classList.toggle('open'); };
+
+    const main = document.createElement('div');
+    main.className = 'day-main';
+    const totalStr = (day.inactive || day.sessions.length === 0) ? '\u2014' : formatDur(dr.total);
+    main.innerHTML = '<div class="day-label">' +
+      '<span class="date">' + day.date + '</span> ' +
+      '<span class="day">' + day.day + '</span>' +
+      '<span class="total">' + totalStr + '</span>' +
+      '</div>';
+
+    if (day.inactive) {
+      main.innerHTML += '<div class="timeline-area" style="display:flex;align-items:center;color:#ccc;font-size:13px;">(no active sessions)</div>' +
+        '<div class="day-summary"></div>';
+      row.appendChild(main);
+      body.appendChild(row);
+      return;
+    }
+
+    const area = document.createElement('div');
+    area.className = 'timeline-area';
+
+    // Grid lines
+    const grid = document.createElement('div');
+    grid.className = 'timeline-grid';
+    const compZone = document.createElement('div');
+    compZone.className = 'compress-zone';
+    compZone.style.left = '0';
+    compZone.style.width = (COMPRESS_WIDTH * 100) + '%';
+    grid.appendChild(compZone);
+    for (let h = COMPRESS_HOUR; h * 60 <= PROP_END; h++) {
+      const pct = minToPercent(h * 60, PROP_START, PROP_END);
+      const line = document.createElement('div');
+      line.className = 'timeline-grid-line';
+      line.style.left = pct + '%';
+      grid.appendChild(line);
+    }
+    area.appendChild(grid);
+
+    // Inter-session gap blocks
+    for (let i = 1; i < dr.sessionData.length; i++) {
+      const prevEnd = dr.sessionData[i - 1].timestamps[dr.sessionData[i - 1].timestamps.length - 1];
+      const currStart = dr.sessionData[i].timestamps[0];
+      const gapMs = currStart - prevEnd;
+      if (gapMs <= 0) continue;
+      const gapStartMin = tsToMinOfDay(prevEnd);
+      const gapEndMin = tsToMinOfDay(currStart);
+      const left = minToPercent(gapStartMin, PROP_START, PROP_END);
+      const right = minToPercent(gapEndMin, PROP_START, PROP_END);
+      const width = right - left;
+      if (width < 0.15) continue;
+      const block = document.createElement('div');
+      block.className = 'gap-block ' + (gapMs <= thresholdMs ? 'included' : 'excluded');
+      block.style.left = left + '%';
+      block.style.width = width + '%';
+      area.appendChild(block);
+    }
+
+    // Session spans
+    dr.sessionData.forEach((s, sIdx) => {
+      const color = SESSION_COLORS[sIdx % SESSION_COLORS.length];
+
+      // Draw intra-session gaps (between spans) as hatched
+      for (let k = 1; k < s.spans.length; k++) {
+        const prevSpanEnd = s.spans[k - 1].to;
+        const nextSpanStart = s.spans[k].from;
+        const gapStartMin = tsToMinOfDay(prevSpanEnd);
+        const gapEndMin = tsToMinOfDay(nextSpanStart);
+        const left = minToPercent(gapStartMin, PROP_START, PROP_END);
+        const right = minToPercent(gapEndMin, PROP_START, PROP_END);
+        if (right - left > 0.1) {
+          const gapEl = document.createElement('div');
+          gapEl.className = 'intra-gap';
+          gapEl.style.left = left + '%';
+          gapEl.style.width = (right - left) + '%';
+          gapEl.style.borderTop = '1px dashed ' + color;
+          gapEl.style.borderBottom = '1px dashed ' + color;
+          gapEl.style.opacity = '0.5';
+          area.appendChild(gapEl);
+        }
+      }
+
+      // Draw each active span
+      s.spans.forEach((span, spanIdx) => {
+        const startMin = tsToMinOfDay(span.from);
+        const endMin = tsToMinOfDay(span.to);
+        const left = minToPercent(startMin, PROP_START, PROP_END);
+        const right = minToPercent(Math.max(endMin, startMin + 0.5), PROP_START, PROP_END);
+        const width = Math.max(right - left, 0.3);
+
+        const block = document.createElement('div');
+        block.className = 'session-span';
+        block.style.left = left + '%';
+        block.style.width = width + '%';
+        block.style.background = color;
+
+        // Tooltip on first span only
+        if (spanIdx === 0) {
+          const startTime = formatTsTime(s.timestamps[0]);
+          const endTime = formatTsTime(s.timestamps[s.timestamps.length - 1]);
+          const activeMins = Math.round(s.activeMinutes);
+          const spanCount = s.spans.length;
+          const branchStr = s.branch ? ' [' + s.branch + ']' : '';
+          block.innerHTML = '<div class="tooltip">' +
+            '<strong>' + startTime + ' \u2014 ' + endTime + '</strong> (' + activeMins + 'm active, ' + spanCount + ' spans)' + branchStr + '<br>' + s.desc +
+            '</div>';
+        }
+        area.appendChild(block);
+      });
+    });
+
+    main.appendChild(area);
+
+    // Day summary on the right
+    const summaryEl = document.createElement('div');
+    summaryEl.className = 'day-summary';
+    const summaries = dr.sessionData.map(s => s.desc).filter(Boolean);
+    const summaryText = summaries.length > 0 ? summaries[0] : '';
+    summaryEl.textContent = summaryText;
+    summaryEl.title = summaries.join('; ');
+    main.appendChild(summaryEl);
+
+    if (day.sessions.length > 0) {
+      const arrow = document.createElement('span');
+      arrow.className = 'toggle-arrow';
+      arrow.innerHTML = '&#9654;';
+      main.appendChild(arrow);
+    }
+
+    row.appendChild(main);
+
+    // Detail panel
+    if (day.sessions.length > 0) {
+      const detail = document.createElement('div');
+      detail.className = 'day-detail';
+
+      let items = [];
+      dr.sessionData.forEach((s, i) => {
+        const startMin = tsToMinOfDay(s.timestamps[0]);
+        const endMin = tsToMinOfDay(s.timestamps[s.timestamps.length - 1]);
+        items.push({
+          type: 'session', startMin, endMin, activeMinutes: s.activeMinutes,
+          spanCount: s.spans.length, desc: s.desc, branch: s.branch, idx: i
+        });
+      });
+
+      // Inter-session gaps
+      for (let i = 1; i < dr.sessionData.length; i++) {
+        const prevEnd = dr.sessionData[i - 1].timestamps[dr.sessionData[i - 1].timestamps.length - 1];
+        const currStart = dr.sessionData[i].timestamps[0];
+        const gapMs = currStart - prevEnd;
+        if (gapMs > 0) {
+          items.push({
+            type: 'gap',
+            startMin: tsToMinOfDay(prevEnd),
+            endMin: tsToMinOfDay(currStart),
+            durMinutes: gapMs / 60000,
+            included: gapMs <= thresholdMs
+          });
+        }
+      }
+      items.sort((a, b) => a.startMin - b.startMin);
+
+      let tableHTML = '<div class="detail-inner"><table class="detail-table">' +
+        '<thead><tr><th></th><th>Time</th><th>Active</th><th>Spans</th><th>Type</th><th>Description</th></tr></thead><tbody>';
+
+      items.forEach(item => {
+        if (item.type === 'session') {
+          const color = SESSION_COLORS[item.idx % SESSION_COLORS.length];
+          const durStr = formatDur(item.activeMinutes);
+          const branchStr = item.branch ? ' [' + item.branch + ']' : '';
+          tableHTML += '<tr>' +
+            '<td class="col-idx"><span class="color-dot" style="background:' + color + ';"></span></td>' +
+            '<td class="col-time">' + formatTime(item.startMin) + ' \u2014 ' + formatTime(item.endMin) + '</td>' +
+            '<td class="col-dur" style="color:' + color + ';">' + durStr + '</td>' +
+            '<td class="col-spans">' + item.spanCount + '</td>' +
+            '<td class="col-gap" style="color:#1a73e8;font-weight:500;">Session</td>' +
+            '<td class="col-desc">' + item.desc + branchStr + '</td>' +
+            '</tr>';
+        } else {
+          const durStr = formatDur(item.durMinutes);
+          const gapColor = item.included ? '#34a853' : '#ea4335';
+          const gapLabel = item.included ? 'Gap \u2713' : 'Gap \u2717';
+          tableHTML += '<tr style="background:' + (item.included ? 'rgba(52,168,83,0.04)' : 'rgba(234,67,53,0.04)') + ';">' +
+            '<td class="col-idx"></td>' +
+            '<td class="col-time" style="color:#aaa;">' + formatTime(item.startMin) + '</td>' +
+            '<td class="col-dur" style="color:' + gapColor + ';">' + durStr + '</td>' +
+            '<td class="col-spans"></td>' +
+            '<td class="col-gap" style="color:' + gapColor + ';font-weight:500;">' + gapLabel + '</td>' +
+            '<td class="col-desc" style="color:#aaa;">Idle ' + durStr + '</td>' +
+            '</tr>';
+        }
+      });
+
+      tableHTML += '</tbody></table></div>';
+      detail.innerHTML = tableHTML;
+      row.appendChild(detail);
+    }
+
+    body.appendChild(row);
+  });
+}
+
+// ========== INIT ==========
+document.getElementById('title').textContent = DATA.meta.project + ' \u2014 Time Report';
+document.getElementById('footer').textContent = 'Generated by Claude Code \u00b7 ' +
+  new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(DATA.meta.generatedAt));
+
+const slider = document.getElementById('threshold-slider');
+const display = document.getElementById('threshold-display');
+const presets = document.getElementById('presets');
+
+function updateThreshold(val) {
+  slider.value = val;
+  display.innerHTML = val + '<span style="font-size:12px;font-weight:400;color:#666;"> min</span>';
+  presets.querySelectorAll('.filter-preset').forEach(btn => {
+    btn.classList.toggle('active', parseInt(btn.dataset.val) === val);
+  });
+  render(val);
+}
+
+slider.addEventListener('input', () => updateThreshold(parseInt(slider.value)));
+presets.querySelectorAll('.filter-preset').forEach(btn => {
+  btn.addEventListener('click', () => updateThreshold(parseInt(btn.dataset.val)));
+});
+
+updateThreshold(15);
+renderCost();
+</script>
+</body>
+</html>

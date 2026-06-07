@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""Claude Code Time Report Generator — v3.0 (cccmemory.db driven).
+
+Uses ~/.cccmemory.db as the primary data source for project/session discovery,
+then reads JSONL files for per-message timestamps.
+
+Usage:
+    python3 time-report.py --list                           # List all projects
+    python3 time-report.py <project> <YYYY-MM>              # Monthly report
+    python3 time-report.py <project> <from> <to>            # Date range
+    python3 time-report.py <project> <YYYY-MM> --json       # JSON output
+    python3 time-report.py <project> <YYYY-MM> -o out.html  # Custom output path
+    python3 time-report.py <project> <YYYY-MM> --open       # Auto-open (default)
+    python3 time-report.py <project> <YYYY-MM> --no-open    # Don't auto-open
+"""
+
+import argparse
+import calendar
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+CLAUDE_DIR = Path.home() / ".claude" / "projects"
+DB_PATH = Path(os.environ.get("CCCMEMORY_DB", str(Path.home() / ".cccmemory.db")))
+
+
+# ── API pricing (USD per 1M tokens) ──────────────────────────────────────────
+# Source: claude-api skill (cached 2026-05-26). Priced as if every call went
+# through the first-party Anthropic API at standard (non-batch) rates.
+# Claude Code subscriptions are billed differently — treat this as an
+# "API-equivalent" cost estimate, not an actual charge.
+# Reference:
+#   - https://www.anthropic.com/pricing#api            (per-model token prices)
+#   - https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+#                                                      (cache write/read multipliers)
+PRICING = {
+    "opus":   {"in": 5.0,  "out": 25.0},   # Opus 4.x
+    "sonnet": {"in": 3.0,  "out": 15.0},   # Sonnet 4.x
+    "haiku":  {"in": 1.0,  "out": 5.0},    # Haiku 4.5
+}
+# Cache costs are multiples of the model's base *input* price.
+CACHE_READ_MULT = 0.10      # cache hit  → 0.1× input
+CACHE_WRITE_5M_MULT = 1.25  # 5-min TTL write → 1.25× input
+CACHE_WRITE_1H_MULT = 2.0   # 1-hour TTL write → 2× input
+
+TOKEN_KEYS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
+
+
+def _model_family(model):
+    """Map a full model id to a pricing family. Unknown → opus (conservative)."""
+    m = (model or "").lower()
+    if "haiku" in m:
+        return "haiku"
+    if "sonnet" in m:
+        return "sonnet"
+    if "opus" in m:
+        return "opus"
+    return "opus"
+
+
+def _empty_tokens():
+    return {k: 0 for k in TOKEN_KEYS}
+
+
+def cost_for_family(family, tok):
+    """USD cost for one family's token bucket."""
+    p = PRICING[family]
+    pin, pout = p["in"], p["out"]
+    return (
+        tok["input"] * pin
+        + tok["output"] * pout
+        + tok["cache_read"] * pin * CACHE_READ_MULT
+        + tok["cache_write_5m"] * pin * CACHE_WRITE_5M_MULT
+        + tok["cache_write_1h"] * pin * CACHE_WRITE_1H_MULT
+    ) / 1_000_000
+
+
+def fmt_tokens(n):
+    """Human-readable token count: 1234 → '1.2K', 4500000 → '4.5M'."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(int(n))
+
+
+def fmt_cost(usd):
+    """Format a USD cost. Sub-cent values still show 2 decimals."""
+    return f"${usd:,.2f}"
+
+
+def _open_db():
+    """Open cccmemory.db, exit with error if missing."""
+    if not DB_PATH.exists():
+        print(f"Error: {DB_PATH} not found.", file=sys.stderr)
+        print("Run: mcp__cccmemory__index_all_projects() to create it.", file=sys.stderr)
+        sys.exit(1)
+    return sqlite3.connect(str(DB_PATH))
+
+
+def _get_project_name(path):
+    """Extract display name from canonical_path."""
+    p = Path(path)
+    # Known project containers: ~/codes/xxx, ~/Projects/xxx, ~/Documents/Projects/xxx
+    if p.parent.name in ("codes", "Projects"):
+        return p.name
+    if len(p.parts) > 2 and p.parts[-2] == "Projects":
+        return p.name
+    # Non-project paths (Home, Downloads, /) → show full path
+    return str(p)
+
+
+def _build_jsonl_index():
+    """Scan ~/.claude/projects/*/ to build session_id → JSONL file path index."""
+    index = {}
+    if not CLAUDE_DIR.exists():
+        return index
+    for d in CLAUDE_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        for jsonl_file in d.glob("*.jsonl"):
+            sid = jsonl_file.stem  # UUID = session_id = external_id
+            index[sid] = str(jsonl_file)
+    return index
+
+
+def list_projects():
+    """List all projects with session counts from DB."""
+    conn = _open_db()
+    rows = conn.execute("""
+        SELECT p.canonical_path, COUNT(c.id)
+        FROM projects p
+        JOIN conversations c ON c.project_id = p.id
+        GROUP BY p.id
+        ORDER BY COUNT(c.id) DESC
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No projects found in database.")
+        return
+
+    print(f"\n{'Project':<40} {'Sessions':>8}  {'Path'}")
+    print("-" * 90)
+    total = 0
+    for path, count in rows:
+        name = _get_project_name(path)
+        print(f"{name:<40} {count:>8}  {path}")
+        total += count
+    print(f"\nTotal: {len(rows)} projects, {total} sessions")
+
+
+def resolve_project(keyword, date_from, date_to):
+    """Find matching project sessions from DB within date range.
+
+    Boundaries are computed in the machine's LOCAL timezone — the same tz the
+    rest of the script uses for grouping/display (datetime.fromtimestamp).
+    Using naive datetimes here makes .timestamp() interpret them as local time;
+    forcing UTC would shift the reported "day" by the local UTC offset.
+    """
+    from_ms = int(datetime.combine(date_from, datetime.min.time())
+                  .timestamp() * 1000)
+    to_ms = int(datetime.combine(date_to + timedelta(days=1), datetime.min.time())
+                .timestamp() * 1000)
+
+    conn = _open_db()
+    rows = conn.execute("""
+        SELECT c.external_id, p.canonical_path, c.git_branch,
+               c.message_count, c.first_message_at, c.last_message_at,
+               c.source_type
+        FROM conversations c
+        JOIN projects p ON c.project_id = p.id
+        WHERE LOWER(p.canonical_path) LIKE ?
+          AND c.last_message_at >= ?
+          AND c.first_message_at < ?
+    """, (f"%{keyword.lower()}%", from_ms, to_ms)).fetchall()
+    conn.close()
+
+    project_paths = sorted(set(r[1] for r in rows))
+    return rows, project_paths, from_ms, to_ms
+
+
+def parse_iso_timestamp(iso_str):
+    """Parse ISO 8601 timestamp string to epoch milliseconds."""
+    if not iso_str:
+        return None
+    try:
+        s = iso_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return int(dt.timestamp() * 1000)
+    except (ValueError, AttributeError):
+        return None
+
+
+def extract_timestamps(jsonl_path):
+    """Read JSONL file, extract timestamps and token usage from records.
+
+    Returns dict with:
+        timestamps: sorted list of epoch ms
+        summary: first user message (truncated)
+        token_events: list of {"ts", "family", <TOKEN_KEYS>} — one per
+            assistant message that carried a usage block. Filtered to the
+            report's date range later by the caller.
+    """
+    timestamps = []
+    token_events = []
+    summary = None
+    skipped = 0
+
+    try:
+        with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    skipped += 1
+                    continue
+
+                rec_type = record.get("type")
+                if rec_type not in ("user", "assistant"):
+                    continue
+
+                ts_str = record.get("timestamp")
+                ts_ms = parse_iso_timestamp(ts_str)
+                if ts_ms:
+                    timestamps.append(ts_ms)
+
+                # Token usage rides on assistant messages
+                if rec_type == "assistant":
+                    ev = _parse_usage(record, ts_ms)
+                    if ev:
+                        token_events.append(ev)
+
+                # Extract summary from first non-meta user message
+                if rec_type == "user" and summary is None and not record.get("isMeta"):
+                    msg = record.get("message", {})
+                    content = msg.get("content", "") if isinstance(msg, dict) else ""
+                    if isinstance(content, str) and content:
+                        clean = re.sub(r"<[^>]+>", "", content).strip()
+                        if clean:
+                            summary = clean[:80]
+
+    except OSError:
+        pass
+
+    if skipped > 0:
+        print(f"  WARN: skipped {skipped} unparseable lines in {jsonl_path}", file=sys.stderr)
+
+    return {
+        "timestamps": sorted(timestamps),
+        "summary": summary,
+        "token_events": token_events,
+    }
+
+
+def _parse_usage(record, ts_ms):
+    """Pull a token-usage event out of one assistant JSONL record, or None."""
+    msg = record.get("message")
+    if not isinstance(msg, dict):
+        return None
+    usage = msg.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    cc = usage.get("cache_creation")
+    if isinstance(cc, dict):
+        w5 = cc.get("ephemeral_5m_input_tokens", 0) or 0
+        w1 = cc.get("ephemeral_1h_input_tokens", 0) or 0
+    else:
+        # Older records: only the flat total — treat as 5-minute writes
+        w5 = usage.get("cache_creation_input_tokens", 0) or 0
+        w1 = 0
+
+    return {
+        "ts": ts_ms,
+        "family": _model_family(msg.get("model")),
+        "input": usage.get("input_tokens", 0) or 0,
+        "output": usage.get("output_tokens", 0) or 0,
+        "cache_read": usage.get("cache_read_input_tokens", 0) or 0,
+        "cache_write_5m": w5,
+        "cache_write_1h": w1,
+    }
+
+
+def aggregate_tokens(token_events):
+    """Sum token events into per-family buckets, an overall bucket, and cost.
+
+    Returns dict: {families: {fam: {tokens, cost}}, tokens: {...,total}, cost}.
+    """
+    families = {}
+    for ev in token_events:
+        fam = ev["family"]
+        bucket = families.setdefault(fam, _empty_tokens())
+        for k in TOKEN_KEYS:
+            bucket[k] += ev[k]
+
+    overall = _empty_tokens()
+    total_cost = 0.0
+    fam_out = {}
+    for fam, tok in families.items():
+        for k in TOKEN_KEYS:
+            overall[k] += tok[k]
+        c = cost_for_family(fam, tok)
+        total_cost += c
+        fam_out[fam] = {"tokens": tok, "cost": round(c, 6)}
+
+    overall["total"] = sum(overall[k] for k in TOKEN_KEYS)
+    return {"families": fam_out, "tokens": overall, "cost": round(total_cost, 6)}
+
+
+def build_report_data(sessions, date_from, date_to, project_name, project_paths):
+    """Build the JSON data structure for the HTML template."""
+    data = {
+        "meta": {
+            "project": project_name,
+            "projectPaths": project_paths,
+            "dateRange": {
+                "from": date_from.isoformat(),
+                "to": date_to.isoformat(),
+            },
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+        },
+        "sessions": sessions,
+    }
+    return data
+
+
+def generate_html(data, template_path):
+    """Read template, inject data, return HTML string."""
+    with open(template_path, encoding="utf-8") as f:
+        template = f.read()
+
+    json_data = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    html = template.replace("__DATA_PLACEHOLDER__", json_data)
+    return html
+
+
+def format_duration(minutes):
+    """Format minutes as 'Xh Ym'."""
+    h = int(minutes // 60)
+    m = int(minutes % 60)
+    if h == 0:
+        return f"{m}m"
+    return f"{h}h {m}m"
+
+
+def compute_active_time(timestamps, threshold_ms=15 * 60 * 1000):
+    """Compute active time from sorted timestamps using gap-threshold algorithm."""
+    if len(timestamps) < 2:
+        return 0
+    active_ms = 0
+    for i in range(1, len(timestamps)):
+        gap = timestamps[i] - timestamps[i - 1]
+        if gap <= threshold_ms:
+            active_ms += gap
+    return active_ms / 60000  # return minutes
+
+
+def print_summary(data):
+    """Print text summary to terminal."""
+    meta = data["meta"]
+    sessions = data["sessions"]
+
+    total_sessions = len(sessions)
+    total_messages = sum(s.get("messageCount", 0) for s in sessions)
+
+    # Active time = UNION across parallel sessions, computed per local day.
+    # Summing per-session active time double-counts overlapping wall-clock when
+    # sessions run concurrently (Claude + Codex + worktrees), which can push the
+    # naive total past 24h/day. Merge each day's timestamps into one stream.
+    by_day = {}
+    parallel_sum = 0.0
+    for s in sessions:
+        ts = s.get("timestamps", [])
+        if not ts:
+            continue
+        parallel_sum += compute_active_time(ts)
+        day = datetime.fromtimestamp(ts[0] / 1000).date()
+        by_day.setdefault(day, []).extend(ts)
+
+    active_days = set(by_day)
+    total_minutes = sum(compute_active_time(sorted(v)) for v in by_day.values())
+
+    # Aggregate tokens + cost across sessions
+    overall = _empty_tokens()
+    fam_cost = {}
+    total_cost = 0.0
+    for s in sessions:
+        tok = s.get("tokens") or {}
+        for k in TOKEN_KEYS:
+            overall[k] += tok.get(k, 0)
+        total_cost += s.get("cost", 0.0)
+        for fam, fd in (s.get("families") or {}).items():
+            fam_cost[fam] = fam_cost.get(fam, 0.0) + fd.get("cost", 0.0)
+    overall_total = sum(overall[k] for k in TOKEN_KEYS)
+
+    print(f"\n{'=' * 50}")
+    print(f"  {meta['project']} — Time Report")
+    print(f"  {meta['dateRange']['from']} → {meta['dateRange']['to']}")
+    print(f"{'=' * 50}")
+    print(f"  Sessions:     {total_sessions}")
+    print(f"  Messages:     {total_messages}")
+    print(f"  Active time:  {format_duration(total_minutes)} (wall-clock, 15min threshold)")
+    print(f"  Parallel sum: {format_duration(parallel_sum)} (per-session, overlap counted)")
+    print(f"  Active days:  {len(active_days)}")
+    if active_days:
+        avg = total_minutes / len(active_days)
+        print(f"  Daily avg:    {format_duration(avg)}")
+    print(f"{'-' * 50}")
+    print(f"  Input:        {fmt_tokens(overall['input']):>10}")
+    print(f"  Output:       {fmt_tokens(overall['output']):>10}")
+    print(f"  Cache write:  {fmt_tokens(overall['cache_write_5m'] + overall['cache_write_1h']):>10}")
+    print(f"  Cache read:   {fmt_tokens(overall['cache_read']):>10}")
+    print(f"  Total tokens: {fmt_tokens(overall_total):>10}")
+    print(f"  Est. cost:    {fmt_cost(total_cost):>10}  (API-equivalent)")
+    if len(fam_cost) > 1:
+        for fam in sorted(fam_cost, key=fam_cost.get, reverse=True):
+            print(f"    - {fam:<8} {fmt_cost(fam_cost[fam]):>10}")
+    print(f"{'=' * 50}\n")
+
+
+def print_table(data):
+    """Print a per-session table report with tokens and API-equivalent cost."""
+    sessions = data["sessions"]
+    if not sessions:
+        return
+
+    rows = []
+    for s in sessions:
+        ts = sorted(s.get("timestamps", []))
+        when = datetime.fromtimestamp(ts[0] / 1000).strftime("%m-%d %H:%M") if ts else "—"
+        tok = s.get("tokens") or {}
+        summary = re.sub(r"\s+", " ", s.get("summary") or "").strip()
+        cw = tok.get("cache_write_5m", 0) + tok.get("cache_write_1h", 0)
+        rows.append({
+            "when": when,
+            "start": ts[0] if ts else 0,
+            "summary": summary[:40],
+            "msgs": s.get("messageCount", 0),
+            "in": tok.get("input", 0),
+            "out": tok.get("output", 0),
+            "cw": cw,
+            "cr": tok.get("cache_read", 0),
+            "total": tok.get("total", 0),
+            "cost": s.get("cost", 0.0),
+        })
+    # Default sort: most token usage first (matches the HTML table default)
+    rows.sort(key=lambda r: r["total"], reverse=True)
+
+    header = (
+        f"{'Time':<12} {'Msgs':>5} {'In':>7} {'Out':>7} "
+        f"{'CacheW':>7} {'CacheR':>8} {'Total':>8} {'Cost':>9}  Summary"
+    )
+    print(header)
+    print("-" * len(header))
+    tot = {"msgs": 0, "in": 0, "out": 0, "cw": 0, "cr": 0, "total": 0, "cost": 0.0}
+    for r in rows:
+        print(
+            f"{r['when']:<12} {r['msgs']:>5} {fmt_tokens(r['in']):>7} "
+            f"{fmt_tokens(r['out']):>7} {fmt_tokens(r['cw']):>7} "
+            f"{fmt_tokens(r['cr']):>8} {fmt_tokens(r['total']):>8} "
+            f"{fmt_cost(r['cost']):>9}  {r['summary']}"
+        )
+        for k in tot:
+            tot[k] += r[k]
+    print("-" * len(header))
+    print(
+        f"{'TOTAL':<12} {tot['msgs']:>5} {fmt_tokens(tot['in']):>7} "
+        f"{fmt_tokens(tot['out']):>7} {fmt_tokens(tot['cw']):>7} "
+        f"{fmt_tokens(tot['cr']):>8} {fmt_tokens(tot['total']):>8} "
+        f"{fmt_cost(tot['cost']):>9}"
+    )
+    print()
+
+
+def parse_date_arg(s):
+    """Parse a date string in YYYY-MM-DD format."""
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid date: {s}. Use YYYY-MM-DD format.")
+
+
+def parse_month_arg(s):
+    """Parse YYYY-MM and return (first_day, last_day) as date objects."""
+    m = re.match(r"^(\d{4})-(\d{2})$", s)
+    if not m:
+        return None
+    year, month = int(m.group(1)), int(m.group(2))
+    first = datetime(year, month, 1).date()
+    last_day = calendar.monthrange(year, month)[1]
+    last = datetime(year, month, last_day).date()
+    return first, last
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Generate interactive HTML time reports for Claude Code sessions.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("args", nargs="*", help="project [YYYY-MM | from-date to-date]")
+    parser.add_argument("--list", action="store_true", help="List all projects")
+    parser.add_argument("--json", action="store_true", help="Output JSON instead of HTML")
+    parser.add_argument("-o", "--output", help="Output file path")
+    parser.add_argument("--open", action="store_true", default=True,
+                        help="Auto-open report in browser (default)")
+    parser.add_argument("--no-open", action="store_true", help="Don't auto-open report")
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.list or not args.args:
+        list_projects()
+        return
+
+    # Parse positional args: project [YYYY-MM | from to]
+    positional = args.args
+    project_keyword = positional[0]
+
+    date_from = None
+    date_to = None
+
+    if len(positional) == 2:
+        month_range = parse_month_arg(positional[1])
+        if month_range:
+            date_from, date_to = month_range
+        else:
+            date_from = parse_date_arg(positional[1])
+            date_to = date_from
+    elif len(positional) == 3:
+        date_from = parse_date_arg(positional[1])
+        date_to = parse_date_arg(positional[2])
+    elif len(positional) == 1:
+        today = datetime.now().date()
+        date_from = today.replace(day=1)
+        date_to = today
+    else:
+        parser.error("Too many arguments. Use: <project> [YYYY-MM | from to]")
+
+    # Resolve project from DB
+    rows, project_paths, from_ms, to_ms = resolve_project(project_keyword, date_from, date_to)
+    if not rows:
+        # Check if project exists at all (without date filter)
+        conn = _open_db()
+        any_match = conn.execute(
+            "SELECT COUNT(*) FROM projects WHERE LOWER(canonical_path) LIKE ?",
+            (f"%{project_keyword.lower()}%",)
+        ).fetchone()[0]
+        conn.close()
+
+        if any_match:
+            print(f"No sessions found for '{project_keyword}' in {date_from} → {date_to}.")
+            print(f"Sessions: 0")
+            sys.exit(0)
+        else:
+            print(f"Error: No project matching '{project_keyword}' found.", file=sys.stderr)
+            print("\nAvailable projects:", file=sys.stderr)
+            list_projects()
+            sys.exit(1)
+
+    # Use stderr for status when JSON output is requested
+    log = (lambda msg: print(msg, file=sys.stderr)) if args.json else print
+
+    log(f"Project: {project_keyword}")
+    log(f"Date range: {date_from} → {date_to}")
+    log(f"DB sessions: {len(rows)}")
+
+    # Build JSONL index
+    jsonl_index = _build_jsonl_index()
+
+    # Extract timestamps from JSONL files
+    sessions = []
+    # Diagnostics for the "matched in index but unreadable" case
+    missing_codex = 0      # Codex sessions: transcripts live under ~/.codex
+    missing_claude = 0     # Claude Code sessions with no local transcript (cleaned up)
+    empty_jsonl = 0        # file present but no parseable timestamps
+    for external_id, proj_path, branch, msg_count, first_at, last_at, source_type in rows:
+        jsonl_path = jsonl_index.get(external_id)
+        if not jsonl_path:
+            if source_type == "codex":
+                missing_codex += 1
+            else:
+                missing_claude += 1
+            continue
+
+        result = extract_timestamps(jsonl_path)
+        if not result["timestamps"]:
+            empty_jsonl += 1
+            continue
+
+        # Filter timestamps to date range
+        ts_in_range = [t for t in result["timestamps"] if from_ms <= t < to_ms]
+        if not ts_in_range:
+            continue
+
+        # Aggregate token usage for events that fall inside the range
+        events_in_range = [
+            ev for ev in result.get("token_events", [])
+            if ev["ts"] is not None and from_ms <= ev["ts"] < to_ms
+        ]
+        usage = aggregate_tokens(events_in_range)
+
+        sessions.append({
+            "id": external_id[:8],
+            "summary": result["summary"] or f"(session {external_id[:8]})",
+            "branch": branch,
+            "messageCount": msg_count or len(ts_in_range),
+            "created": "",
+            "timestamps": ts_in_range,
+            "tokens": usage["tokens"],
+            "cost": usage["cost"],
+            "families": usage["families"],
+        })
+
+    log(f"Sessions with data: {len(sessions)}")
+
+    if not sessions:
+        log("No sessions with readable transcripts in this date range.")
+        if missing_codex or missing_claude or empty_jsonl:
+            log(f"  {len(rows)} session(s) matched in the index but have no usable "
+                f"transcript in ~/.claude/projects:")
+            if missing_codex:
+                log(f"    • {missing_codex} Codex session(s) — transcripts live under "
+                    f"~/.codex, which this report does not read.")
+            if missing_claude:
+                log(f"    • {missing_claude} Claude Code session(s) — no local transcript "
+                    f"found (likely deleted by Claude Code's transcript cleanup, which "
+                    f"defaults to ~30 days; older months won't have token/cost data).")
+            if empty_jsonl:
+                log(f"    • {empty_jsonl} transcript(s) present but with no parseable "
+                    f"timestamps.")
+            log("  Token/cost figures require the original JSONL transcript, so this "
+                "period can't be reported. Recent ranges (within the retention window) "
+                "work fully.")
+        if args.json:
+            print(json.dumps({"meta": {"project": project_keyword,
+                                        "dateRange": {"from": str(date_from), "to": str(date_to)}},
+                               "sessions": []}, indent=2))
+        sys.exit(0)
+
+    # Build report data
+    project_display = _get_project_name(project_paths[0]) if project_paths else project_keyword
+    report_data = build_report_data(sessions, date_from, date_to, project_display, project_paths)
+
+    # JSON output mode
+    if args.json:
+        print(json.dumps(report_data, indent=2, ensure_ascii=False))
+        return
+
+    # Generate HTML
+    template_path = Path(__file__).parent.parent / "references" / "template.html"
+    if not template_path.exists():
+        print(f"Error: Template not found at {template_path}", file=sys.stderr)
+        sys.exit(1)
+
+    html = generate_html(report_data, template_path)
+
+    # Output path
+    range_str = f"{date_from}_{date_to}"
+    default_output = f"/tmp/time-report-{project_display}-{range_str}.html"
+    output_path = args.output or default_output
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"Report saved to: {output_path}")
+
+    # Print summary + per-session table report
+    print_summary(report_data)
+    print_table(report_data)
+
+    # Auto-open
+    if not args.no_open:
+        if sys.platform == "darwin":
+            subprocess.run(["open", output_path], check=False)
+        elif sys.platform == "linux":
+            subprocess.run(["xdg-open", output_path], check=False)
+        elif sys.platform == "win32":
+            os.startfile(output_path)
+
+
+if __name__ == "__main__":
+    main()
