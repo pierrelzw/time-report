@@ -476,18 +476,36 @@ def print_summary(data):
     # Summing per-session active time double-counts overlapping wall-clock when
     # sessions run concurrently (Claude + Codex + worktrees), which can push the
     # naive total past 24h/day. Merge each day's timestamps into one stream.
-    by_day = {}
-    parallel_sum = 0.0
+    #
+    # Group each event by the LOCAL calendar day it actually falls on, so a
+    # session that crosses midnight is split across both days. This mirrors the
+    # HTML timeline (template.html: `dayTs = s.timestamps.filter(... per day)`).
+    # The previous version bucketed a whole session under its FIRST event's day,
+    # which made the terminal total drift from the HTML for cross-midnight
+    # sessions (e.g. 33h here vs the HTML's 29h).
+    day_streams = {}   # day -> all timestamps that day (merged → union)
+    day_sessions = {}  # day -> [per-session ts lists] (for the parallel sum)
     for s in sessions:
         ts = s.get("timestamps", [])
         if not ts:
             continue
-        parallel_sum += compute_active_time(ts)
-        day = datetime.fromtimestamp(ts[0] / 1000).date()
-        by_day.setdefault(day, []).extend(ts)
+        per_day = {}
+        for t in ts:
+            d = datetime.fromtimestamp(t / 1000).date()
+            per_day.setdefault(d, []).append(t)
+        for d, dts in per_day.items():
+            day_streams.setdefault(d, []).extend(dts)
+            day_sessions.setdefault(d, []).append(dts)
 
-    active_days = set(by_day)
-    total_minutes = sum(compute_active_time(sorted(v)) for v in by_day.values())
+    active_days = set(day_streams)
+    total_minutes = sum(compute_active_time(sorted(v)) for v in day_streams.values())
+    # Parallel sum = naive per-session-per-day total (overlap counted); the
+    # union above collapses overlapping parallel work, so total_minutes ≤ this.
+    parallel_sum = sum(
+        compute_active_time(sorted(dts))
+        for day_list in day_sessions.values()
+        for dts in day_list
+    )
 
     # Aggregate tokens + cost across sessions
     overall = _empty_tokens()
