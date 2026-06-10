@@ -701,6 +701,29 @@ def main():
     log(f"Date range: {date_from} → {date_to}")
     log(f"DB sessions: {len(rows)}")
 
+    # Dedup: the same session is registered under every project path it touched,
+    # so a session that ran in a git worktree under the repo (e.g.
+    # <repo>/.claude/worktrees/<name>) is matched twice by our `LIKE %keyword%`
+    # query — once for the repo path, once for the worktree path. Both rows carry
+    # the same external_id and resolve to the same transcript file, so counting
+    # both double-counts that session's tokens/cost/message totals. Keep one row
+    # per external_id. (This does NOT change Active Time: the per-day union is
+    # idempotent over identical timestamps. Codex and Claude Code never share an
+    # external_id, so this is also safe once Codex sessions are mixed in.)
+    seen_ids = set()
+    deduped_rows = []
+    for row in rows:
+        external_id = row[0]
+        if external_id in seen_ids:
+            continue
+        seen_ids.add(external_id)
+        deduped_rows.append(row)
+    dup_count = len(rows) - len(deduped_rows)
+    rows = deduped_rows
+    if dup_count:
+        log(f"Deduped: dropped {dup_count} duplicate session row(s) "
+            f"(same session under repo + worktree paths) → {len(rows)} unique")
+
     # Build JSONL index
     jsonl_index = _build_jsonl_index()
 
