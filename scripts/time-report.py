@@ -29,6 +29,7 @@ from pathlib import Path
 
 
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
+CODEX_DIR = Path.home() / ".codex"  # Codex CLI session transcripts live here
 DB_PATH = Path(os.environ.get("CCCMEMORY_DB", str(Path.home() / ".cccmemory.db")))
 
 
@@ -129,6 +130,34 @@ def _build_jsonl_index():
         for jsonl_file in d.glob("*.jsonl"):
             sid = jsonl_file.stem  # UUID = session_id = external_id
             index[sid] = str(jsonl_file)
+    return index
+
+
+# Codex names its transcripts rollout-<ISO-timestamp>-<uuid>.jsonl; the uuid is
+# the conversation's external_id in the DB. Match that trailing uuid.
+_CODEX_UUID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
+)
+
+
+def _build_codex_index():
+    """Scan ~/.codex/{sessions,archived_sessions} → session_id → JSONL path.
+
+    Claude Code keeps transcripts under ~/.claude/projects; Codex keeps its own
+    under ~/.codex, which `_build_jsonl_index` never sees. Without this, every
+    Codex session resolves to "no transcript" and is dropped from the report.
+    """
+    index = {}
+    if not CODEX_DIR.exists():
+        return index
+    for sub in ("sessions", "archived_sessions"):
+        base = CODEX_DIR / sub
+        if not base.exists():
+            continue
+        for jsonl_file in base.rglob("*.jsonl"):
+            m = _CODEX_UUID_RE.search(jsonl_file.stem)
+            if m:
+                index[m.group(1)] = str(jsonl_file)
     return index
 
 
@@ -328,6 +357,108 @@ def aggregate_tokens(token_events):
 
     overall["total"] = sum(overall[k] for k in TOKEN_KEYS)
     return {"families": fam_out, "tokens": overall, "cost": round(total_cost, 6)}
+
+
+# Codex's first user "messages" are injected wrappers (environment context,
+# AGENTS.md / persona instructions), not the human's prompt — skip them when
+# picking a summary line.
+_CODEX_WRAPPER_RE = re.compile(r"^\s*<(environment_context|user_instructions|"
+                               r"persona|system)", re.I)
+
+
+def _codex_is_wrapper(text):
+    s = text.strip()
+    return bool(_CODEX_WRAPPER_RE.match(s)) or s.startswith("# AGENTS.md")
+
+
+def extract_codex_timestamps(jsonl_path):
+    """Codex-flavoured counterpart to extract_timestamps().
+
+    Codex JSONL differs from Claude Code: every record has a top-level ISO
+    `timestamp`; token usage rides on `event_msg`/`token_count` payloads whose
+    `last_token_usage` is the per-turn delta (verified to sum to the session's
+    cumulative `total_token_usage`). Codex runs OpenAI models, so we deliberately
+    DO NOT price it — token counts are reported, cost is left to the caller
+    (marked N/A) to keep the headline $ a pure Anthropic-API-equivalent figure.
+    """
+    timestamps = []
+    token_events = []
+    summary = None
+    skipped = 0
+
+    try:
+        with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    skipped += 1
+                    continue
+
+                ts_ms = parse_iso_timestamp(record.get("timestamp"))
+                if ts_ms:
+                    timestamps.append(ts_ms)
+
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                ptype = payload.get("type")
+
+                if ptype == "token_count":
+                    info = payload.get("info") or {}
+                    lu = info.get("last_token_usage") or {}
+                    inp = lu.get("input_tokens", 0) or 0
+                    cached = lu.get("cached_input_tokens", 0) or 0
+                    token_events.append({
+                        "ts": ts_ms,
+                        # Codex's input_tokens INCLUDES the cached portion; split
+                        # it so input = uncached prompt, cache_read = cached.
+                        "input": max(inp - cached, 0),
+                        "output": lu.get("output_tokens", 0) or 0,
+                        "cache_read": cached,
+                        "cache_write_5m": 0,
+                        "cache_write_1h": 0,
+                    })
+                elif ptype == "message" and payload.get("role") == "user" \
+                        and summary is None:
+                    for c in payload.get("content", []):
+                        tx = c.get("text", "") if isinstance(c, dict) else ""
+                        if tx and not _codex_is_wrapper(tx):
+                            clean = re.sub(r"<[^>]+>", "", tx).strip()
+                            if clean:
+                                summary = clean[:80]
+                                break
+    except OSError:
+        pass
+
+    if skipped > 0:
+        print(f"  WARN: skipped {skipped} unparseable lines in {jsonl_path}",
+              file=sys.stderr)
+
+    return {
+        "timestamps": sorted(timestamps),
+        "summary": summary,
+        "title": None,  # Codex has no auto-title; falls back to summary
+        "token_events": token_events,
+    }
+
+
+def aggregate_codex_tokens(token_events):
+    """Sum Codex token events WITHOUT pricing (Codex = OpenAI models).
+
+    Same return shape as aggregate_tokens() but cost is 0 and families is empty,
+    so Codex contributes token counts to the totals while staying out of the
+    Anthropic-equivalent $ figure. The caller marks the session cost as N/A.
+    """
+    overall = _empty_tokens()
+    for ev in token_events:
+        for k in TOKEN_KEYS:
+            overall[k] += ev.get(k, 0)
+    overall["total"] = sum(overall[k] for k in TOKEN_KEYS)
+    return {"families": {}, "tokens": overall, "cost": 0.0}
 
 
 # ── Transcript visualization (claude-code-transcripts) ───────────────────────
@@ -569,6 +700,7 @@ def print_table(data):
             "cr": tok.get("cache_read", 0),
             "total": tok.get("total", 0),
             "cost": s.get("cost", 0.0),
+            "costNA": s.get("costNA", False),
         })
     # Default sort: most token usage first (matches the HTML table default)
     rows.sort(key=lambda r: r["total"], reverse=True)
@@ -581,11 +713,13 @@ def print_table(data):
     print("-" * len(header))
     tot = {"msgs": 0, "in": 0, "out": 0, "cw": 0, "cr": 0, "total": 0, "cost": 0.0}
     for r in rows:
+        # Codex sessions are not priced (OpenAI model) → show "—", omit from $ total
+        cost_str = "—" if r["costNA"] else fmt_cost(r["cost"])
         print(
             f"{r['when']:<12} {r['msgs']:>5} {fmt_tokens(r['in']):>7} "
             f"{fmt_tokens(r['out']):>7} {fmt_tokens(r['cw']):>7} "
             f"{fmt_tokens(r['cr']):>8} {fmt_tokens(r['total']):>8} "
-            f"{fmt_cost(r['cost']):>9}  {r['summary']}"
+            f"{cost_str:>9}  {r['summary']}"
         )
         for k in tot:
             tot[k] += r[k]
@@ -724,25 +858,30 @@ def main():
         log(f"Deduped: dropped {dup_count} duplicate session row(s) "
             f"(same session under repo + worktree paths) → {len(rows)} unique")
 
-    # Build JSONL index
+    # Build JSONL indexes (Claude Code under ~/.claude, Codex under ~/.codex)
     jsonl_index = _build_jsonl_index()
+    codex_index = _build_codex_index()
 
     # Extract timestamps from JSONL files
     sessions = []
     # Diagnostics for the "matched in index but unreadable" case
-    missing_codex = 0      # Codex sessions: transcripts live under ~/.codex
+    missing_codex = 0      # Codex sessions: transcript not found under ~/.codex
     missing_claude = 0     # Claude Code sessions with no local transcript (cleaned up)
     empty_jsonl = 0        # file present but no parseable timestamps
     for external_id, proj_path, branch, msg_count, first_at, last_at, source_type in rows:
+        is_codex = (source_type == "codex")
         jsonl_path = jsonl_index.get(external_id)
+        if not jsonl_path and is_codex:
+            jsonl_path = codex_index.get(external_id)
         if not jsonl_path:
-            if source_type == "codex":
+            if is_codex:
                 missing_codex += 1
             else:
                 missing_claude += 1
             continue
 
-        result = extract_timestamps(jsonl_path)
+        result = (extract_codex_timestamps(jsonl_path) if is_codex
+                  else extract_timestamps(jsonl_path))
         if not result["timestamps"]:
             empty_jsonl += 1
             continue
@@ -752,16 +891,21 @@ def main():
         if not ts_in_range:
             continue
 
-        # Aggregate token usage for events that fall inside the range
+        # Aggregate token usage for events that fall inside the range. Codex runs
+        # OpenAI models, so its tokens are counted but NOT priced (cost N/A) —
+        # keeps the headline $ a pure Anthropic-API-equivalent figure.
         events_in_range = [
             ev for ev in result.get("token_events", [])
             if ev["ts"] is not None and from_ms <= ev["ts"] < to_ms
         ]
-        usage = aggregate_tokens(events_in_range)
+        usage = (aggregate_codex_tokens(events_in_range) if is_codex
+                 else aggregate_tokens(events_in_range))
 
         sessions.append({
             "id": external_id[:8],
             "fullId": external_id,
+            "source": source_type,
+            "costNA": is_codex,  # cost not computed (OpenAI model) → render "—"
             "title": result.get("title") or "",
             "summary": result["summary"] or f"(session {external_id[:8]})",
             "branch": branch,
@@ -777,24 +921,28 @@ def main():
 
     log(f"Sessions with data: {len(sessions)}")
 
+    # Always surface unreadable sessions, even when others were read — otherwise
+    # a silently-dropped subset (e.g. Codex sessions whose transcript is gone)
+    # makes the totals look complete when they aren't.
+    if missing_codex or missing_claude or empty_jsonl:
+        log("  Note: some matched sessions had no usable transcript and were "
+            "excluded from the totals:")
+        if missing_codex:
+            log(f"    • {missing_codex} Codex session(s) — no transcript found "
+                f"under ~/.codex (older sessions may have been cleaned up).")
+        if missing_claude:
+            log(f"    • {missing_claude} Claude Code session(s) — no local "
+                f"transcript found (likely past Claude Code's ~30-day cleanup).")
+        if empty_jsonl:
+            log(f"    • {empty_jsonl} transcript(s) present but with no parseable "
+                f"timestamps.")
+
     if not sessions:
         log("No sessions with readable transcripts in this date range.")
         if missing_codex or missing_claude or empty_jsonl:
-            log(f"  {len(rows)} session(s) matched in the index but have no usable "
-                f"transcript in ~/.claude/projects:")
-            if missing_codex:
-                log(f"    • {missing_codex} Codex session(s) — transcripts live under "
-                    f"~/.codex, which this report does not read.")
-            if missing_claude:
-                log(f"    • {missing_claude} Claude Code session(s) — no local transcript "
-                    f"found (likely deleted by Claude Code's transcript cleanup, which "
-                    f"defaults to ~30 days; older months won't have token/cost data).")
-            if empty_jsonl:
-                log(f"    • {empty_jsonl} transcript(s) present but with no parseable "
-                    f"timestamps.")
-            log("  Token/cost figures require the original JSONL transcript, so this "
-                "period can't be reported. Recent ranges (within the retention window) "
-                "work fully.")
+            log("  Token/cost figures require the original JSONL transcript, so "
+                "this period can't be reported. Recent ranges (within the "
+                "retention window) work fully.")
         if args.json:
             print(json.dumps({"meta": {"project": project_keyword,
                                         "dateRange": {"from": str(date_from), "to": str(date_to)}},

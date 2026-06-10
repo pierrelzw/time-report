@@ -1,7 +1,7 @@
 ---
 name: time-report
 description: 生成 Claude Code 会话时间的交互式 HTML 甘特图报告。用法：/time-report <project> <month|from to> 或 /time-report --list
-version: 3.3.0
+version: 3.4.0
 tools: Bash, mcp__cccmemory__index_all_projects
 ---
 
@@ -54,11 +54,13 @@ The skill produces an interactive HTML report (written to `/tmp/time-report-<pro
 
 The terminal also prints a text summary (active time, total tokens, estimated cost, per-model cost breakdown) followed by a **per-session table report** with the same token/cost columns.
 
+**Sources & dedup.** The report includes both **Claude Code** (transcripts under `~/.claude/projects`) and **Codex** (`~/.codex/sessions` + `archived_sessions`) sessions. Sessions are deduped by their `external_id`, so a session that ran in a git worktree under the repo — and is therefore registered under both the repo path and the worktree path — is counted once. **Active Time** unions every session's events per calendar day, so parallel sessions (including Codex running alongside Claude) only count their overlapping wall-clock once.
+
 When `--list` is used instead, the script prints a plain-text table of projects with their session counts to stdout — no HTML file is produced.
 
 ### Cost methodology
 
-Costs are computed from each assistant message's `usage` block in the session JSONL, priced **as if every call went through the first-party Anthropic API at standard (non-batch) rates** — Opus $5/$25, Sonnet $3/$15, Haiku $1/$5 per 1M input/output tokens; cache writes 1.25× (5-min) / 2× (1-hour) input, cache reads 0.1× input (pricing cached from the `claude-api` skill, 2026-05-26). Model family is inferred from the `model` field per message, so mixed-model sessions (e.g. Haiku subagents) are priced correctly. **This is an API-equivalent estimate, not your actual Claude Code subscription charge** — subscriptions are billed differently. To refresh prices, edit the `PRICING` dict in `scripts/time-report.py`.
+Costs are computed from each assistant message's `usage` block in the session JSONL, priced **as if every call went through the first-party Anthropic API at standard (non-batch) rates** — Opus $5/$25, Sonnet $3/$15, Haiku $1/$5 per 1M input/output tokens; cache writes 1.25× (5-min) / 2× (1-hour) input, cache reads 0.1× input (pricing cached from the `claude-api` skill, 2026-05-26). Model family is inferred from the `model` field per message, so mixed-model sessions (e.g. Haiku subagents) are priced correctly. **This is an API-equivalent estimate, not your actual Claude Code subscription charge** — subscriptions are billed differently. **Codex sessions are not priced** (they run OpenAI models): their time and token counts are included, but the Cost column shows "—" and they are excluded from the `$` total, keeping it a pure Anthropic-API-equivalent figure. To refresh prices, edit the `PRICING` dict in `scripts/time-report.py`.
 
 Price references:
 - Per-model token prices: <https://www.anthropic.com/pricing#api>

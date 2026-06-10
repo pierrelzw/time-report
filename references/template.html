@@ -217,6 +217,8 @@
       <br>
       <b>例</b>:Input 11,392 · Output 9,176 · Cache Write(1h) 135,673 · Cache Read 857,048 → <b>$2.07</b>(codex 复核 ✓)。Input / Cache Read / Cache Write 为互不重叠的三类 token。
       <br>
+      <b>Codex 会话</b>:跑的是 OpenAI 模型,只统计时间与 token,<b>不计价</b>(Cost 列显示「—」、不计入 $ 总额);时间仍并入当天 union,与 Claude 会话并行的部分只算一次。
+      <br>
       <span style="color:#aaa;">估算值,非订阅实际扣费 · 参考 <a href="https://www.anthropic.com/pricing#api" target="_blank" rel="noopener" style="color:#1a73e8;">API 定价</a> / <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching" target="_blank" rel="noopener" style="color:#1a73e8;">缓存计费</a></span>
     </div>
   </div>
@@ -364,6 +366,7 @@ function buildCostRows() {
         input, output, cw, cr,
         total: input + output + cw + cr,
         cost: s.cost || 0,
+        costNA: !!s.costNA,  // Codex (OpenAI model) → token counts only, no price
       };
     });
 
@@ -404,7 +407,7 @@ function drawCostTable() {
       '<td>' + fmtTokens(r.cw) + '</td>' +
       '<td>' + fmtTokens(r.cr) + '</td>' +
       '<td>' + fmtTokens(r.total) + '</td>' +
-      '<td class="cost-val">' + fmtCost(r.cost) + '</td>' +
+      '<td class="cost-val">' + (r.costNA ? '—' : fmtCost(r.cost)) + '</td>' +
       '</tr>';
   }).join('');
 
