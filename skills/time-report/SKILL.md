@@ -1,8 +1,8 @@
 ---
 name: time-report
-description: 生成 Claude Code 会话时间的交互式 HTML 甘特图报告。用法：/time-report <project> <month|from to> 或 /time-report --list
-version: 3.4.0
-tools: Bash, mcp__cccmemory__index_all_projects
+description: 生成 Claude Code + Codex 会话时间的交互式 HTML 甘特图报告（时间/token/成本）。用法：/time-report <project> <month|from to> 或 /time-report --list
+user-invocable: true
+allowed-tools: Bash, mcp__cccmemory__index_all_projects
 ---
 
 # Time Report
@@ -27,14 +27,14 @@ mcp__cccmemory__index_all_projects(incremental=true)
 
 ### Step 2: Generate report
 ```bash
-python3 {baseDir}/scripts/time-report.py $ARGUMENTS --open
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/time-report/scripts/time-report.py $ARGUMENTS --open
 ```
 
 **Transcript visualization (opt-in).** If the user's request mentions transcripts or
 session visualization — e.g. "transcript(s)", "可视化", "会话可视化", "看会话内容",
 "view sessions", "session viewer" — append `--transcripts`:
 ```bash
-python3 {baseDir}/scripts/time-report.py <project> <range> --transcripts --open
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/time-report/scripts/time-report.py <project> <range> --transcripts --open
 ```
 This renders every in-range session into a static HTML bundle via
 `claude-code-transcripts` (run through `uvx`; the tool is fetched/cached on first use)
