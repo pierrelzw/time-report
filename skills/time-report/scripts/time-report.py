@@ -240,6 +240,7 @@ def extract_timestamps(jsonl_path):
             report's date range later by the caller.
     """
     timestamps = []
+    human_timestamps = []  # subset: timestamps of real human turns (see _is_human_turn)
     token_events = []
     summary = None
     title = None  # latest Claude Code auto-generated session title (ai-title record)
@@ -281,14 +282,21 @@ def extract_timestamps(jsonl_path):
                     if ev:
                         token_events.append(ev)
 
-                # Extract summary from first non-meta user message
-                if rec_type == "user" and summary is None and not record.get("isMeta"):
+                if rec_type == "user":
                     msg = record.get("message", {})
                     content = msg.get("content", "") if isinstance(msg, dict) else ""
-                    if isinstance(content, str) and content:
-                        clean = re.sub(r"<[^>]+>", "", content).strip()
-                        if clean:
-                            summary = clean[:80]
+                    # Real human turn: a typed prompt / short confirmation / slash
+                    # command — NOT a tool_result (content is a list of tool_result
+                    # blocks) and NOT a system-injected meta record. This is the
+                    # signal for "human online" time. See _is_human_turn.
+                    if _is_human_turn(record, content) and ts_ms:
+                        human_timestamps.append(ts_ms)
+                        # Summary = first human turn's text (was: first non-meta user)
+                        if summary is None:
+                            text = content if isinstance(content, str) else _first_text_block(content)
+                            clean = re.sub(r"<[^>]+>", "", text or "").strip()
+                            if clean:
+                                summary = clean[:80]
 
     except OSError:
         pass
@@ -298,10 +306,43 @@ def extract_timestamps(jsonl_path):
 
     return {
         "timestamps": sorted(timestamps),
+        "human_timestamps": sorted(human_timestamps),
         "summary": summary,
         "title": title,
         "token_events": token_events,
     }
+
+
+def _first_text_block(content):
+    """Return the first text block's text from a list-shaped message content."""
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                t = b.get("text", "")
+                if t:
+                    return t
+    return ""
+
+
+def _is_human_turn(record, content):
+    """True if a Claude Code `type=="user"` record is a REAL human turn.
+
+    Counts: typed prompts, short confirmations ("好的", "continue"), and slash
+    commands — all carry string content (or a list with a text block).
+    Excludes: tool_result records (content is a list whose blocks are
+    tool_result — these are the harness feeding tool output back, not the human)
+    and system-injected meta records (isMeta).
+    """
+    if record.get("isMeta"):
+        return False
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        kinds = [b.get("type") for b in content if isinstance(b, dict)]
+        if "tool_result" in kinds:
+            return False
+        return "text" in kinds
+    return False
 
 
 def _parse_usage(record, ts_ms):
@@ -382,6 +423,7 @@ def extract_codex_timestamps(jsonl_path):
     (marked N/A) to keep the headline $ a pure Anthropic-API-equivalent figure.
     """
     timestamps = []
+    human_timestamps = []  # subset: real human turns (role==user, non-wrapper text)
     token_events = []
     summary = None
     skipped = 0
@@ -422,15 +464,23 @@ def extract_codex_timestamps(jsonl_path):
                         "cache_write_5m": 0,
                         "cache_write_1h": 0,
                     })
-                elif ptype == "message" and payload.get("role") == "user" \
-                        and summary is None:
+                elif ptype == "message" and payload.get("role") == "user":
+                    # A real human turn iff it carries non-wrapper text (skips
+                    # environment_context / AGENTS.md injections). Same role as
+                    # the human-online signal in extract_timestamps.
+                    human_text = None
                     for c in payload.get("content", []):
                         tx = c.get("text", "") if isinstance(c, dict) else ""
                         if tx and not _codex_is_wrapper(tx):
-                            clean = re.sub(r"<[^>]+>", "", tx).strip()
+                            human_text = tx
+                            break
+                    if human_text is not None:
+                        if ts_ms:
+                            human_timestamps.append(ts_ms)
+                        if summary is None:
+                            clean = re.sub(r"<[^>]+>", "", human_text).strip()
                             if clean:
                                 summary = clean[:80]
-                                break
     except OSError:
         pass
 
@@ -440,6 +490,7 @@ def extract_codex_timestamps(jsonl_path):
 
     return {
         "timestamps": sorted(timestamps),
+        "human_timestamps": sorted(human_timestamps),
         "summary": summary,
         "title": None,  # Codex has no auto-title; falls back to summary
         "token_events": token_events,
@@ -547,6 +598,188 @@ def generate_transcripts(sessions, project_paths, override, log):
     return base
 
 
+def _resolve_summaries_base(project_paths, override):
+    """Pick the directory to cache AI one-line summaries under.
+
+    Mirrors _resolve_transcripts_base: default
+    <project canonical path that exists on disk>/time-report-summaries.
+    """
+    if override:
+        return Path(override).expanduser()
+    existing = [p for p in project_paths if Path(p).is_dir()]
+    codes = [p for p in existing if "/codes/" in p]
+    chosen = (codes or existing or project_paths or [str(Path.cwd())])[0]
+    return Path(chosen) / "time-report-summaries"
+
+
+def _claude_cli():
+    """Locate the Claude Code CLI binary, so AI summaries reuse the user's
+    existing subscription login (no ANTHROPIC_API_KEY needed). Returns the
+    path string, or None if not found."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    fallback = Path.home() / ".local" / "bin" / "claude"
+    return str(fallback) if fallback.exists() else None
+
+
+def _extract_digest_text(jsonl_path, is_codex, max_chars=12000):
+    """Pull a compact "what happened" digest from a session JSONL: the human
+    prompts, assistant prose, and the actions taken (edited files, bash
+    commands, todos). This feeds the AI summarizer — it is NOT the raw
+    transcript. Returns a string (possibly empty).
+
+    Kept deliberately loose so it tolerates both Claude Code and Codex shapes;
+    anything it can't parse is skipped rather than raised.
+    """
+    parts = []
+    try:
+        with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Codex shape: everything is nested under `payload`.
+                if is_codex and isinstance(rec.get("payload"), dict):
+                    pl = rec["payload"]
+                    ptype = pl.get("type")
+                    if ptype == "message":
+                        role = pl.get("role")
+                        for c in pl.get("content", []):
+                            tx = c.get("text", "") if isinstance(c, dict) else ""
+                            tx = re.sub(r"<[^>]+>", "", tx).strip()
+                            if tx and not (role == "user" and _codex_is_wrapper(tx)):
+                                parts.append(f"[{role or '?'}] {tx}")
+                    elif ptype in ("function_call", "local_shell_call"):
+                        name = pl.get("name", ptype)
+                        a = pl.get("arguments") or pl.get("action") or ""
+                        parts.append(f"[tool:{name}] {str(a)[:160]}".rstrip())
+                    continue
+
+                if rec.get("type") not in ("user", "assistant", "message", None):
+                    continue
+                msg = rec.get("message", rec)
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role") or rec.get("role")
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    text = re.sub(r"<[^>]+>", "", content).strip()
+                    if text:
+                        parts.append(f"[{role or '?'}] {text}")
+                    continue
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        text = re.sub(r"<[^>]+>", "", block.get("text", "")).strip()
+                        if text:
+                            parts.append(f"[{role or '?'}] {text}")
+                    elif btype == "tool_use":
+                        name = block.get("name", "tool")
+                        inp = block.get("input", {}) or {}
+                        hint = (inp.get("file_path") or inp.get("command")
+                                or inp.get("path") or inp.get("pattern") or "")
+                        if name == "TodoWrite":
+                            todos = inp.get("todos", [])
+                            done = [t.get("content", "") for t in todos
+                                    if isinstance(t, dict) and t.get("status") == "completed"]
+                            if done:
+                                parts.append("[todo-done] " + "; ".join(done[:10]))
+                        else:
+                            parts.append(f"[tool:{name}] {str(hint)[:160]}".rstrip())
+    except OSError:
+        return ""
+
+    text = "\n".join(parts)
+    if len(text) <= max_chars:
+        return text
+    # Keep the opening ask plus the tail (where outcomes/commits live).
+    head = text[:3000]
+    tail = text[-(max_chars - 3000):]
+    return head + "\n...\n" + tail
+
+
+_AI_SUMMARY_PROMPT = (
+    "你在阅读一个编程/AI 会话的活动记录(用户提问、助手回复、执行的工具操作)。\n"
+    "请用一句话概括这次会话「实际完成了什么、得到了什么成果」,聚焦结果而非用户的第一句话。\n"
+    "要求:不超过 30 个汉字;只输出这一句话本身,不要引号、不要前后缀、不要句末标点。\n\n"
+    "会话记录:\n"
+)
+
+
+def generate_ai_summaries(sessions, project_paths, override, log,
+                          model="haiku", max_workers=4):
+    """Fill each session's `aiSummary` with a one-line "what got done" synopsis,
+    generated by the Claude Code CLI (reusing the user's subscription login).
+
+    Idempotent: cached to <base>/<fullId>.txt and reused on later runs, so the
+    cost is paid once per session. Degrades gracefully — if the CLI is missing
+    or a call fails, that session keeps `aiSummary=None` and the report falls
+    back to the first-prompt summary. Returns the cache base dir, or None.
+    """
+    cli = _claude_cli()
+    if not cli:
+        log("  WARN: `claude` CLI not found — skipping AI summaries (Summary "
+            "column falls back to the first prompt). Use --no-ai-summary to "
+            "silence this.")
+        return None
+
+    base = _resolve_summaries_base(project_paths, override)
+    base.mkdir(parents=True, exist_ok=True)
+    log(f"AI summaries → {base}")
+
+    targets = [s for s in sessions if s.get("jsonlPath")]
+
+    def _one(s):
+        cache = base / ((s.get("fullId") or s["id"]) + ".txt")
+        if cache.exists():
+            cached = cache.read_text(encoding="utf-8").strip()
+            if cached:
+                return s, cached, True, None  # reuse
+        digest = _extract_digest_text(s["jsonlPath"], s.get("source") == "codex")
+        if not digest.strip():
+            return s, None, False, "empty digest"
+        try:
+            r = subprocess.run(
+                [cli, "-p", "--model", model],
+                input=_AI_SUMMARY_PROMPT + digest,
+                capture_output=True, text=True, timeout=120,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return s, None, False, str(e)
+        if r.returncode != 0:
+            return s, None, False, (r.stderr or "nonzero exit").strip()[:200]
+        out = re.sub(r"\s+", " ", r.stdout).strip().strip('"“”「」')
+        if not out:
+            return s, None, False, "empty output"
+        out = out[:60]
+        cache.write_text(out, encoding="utf-8")
+        return s, out, True, None
+
+    ok = failed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for s, summary, success, err in ex.map(_one, targets):
+            if success:
+                s["aiSummary"] = summary
+                ok += 1
+            else:
+                s["aiSummary"] = None
+                failed += 1
+                log(f"  WARN: AI summary failed for {s['id']}: {err}")
+    log(f"AI summaries: {ok}/{len(targets)} ready"
+        + (f", {failed} failed" if failed else ""))
+    return base
+
+
 def build_report_data(sessions, date_from, date_to, project_name, project_paths):
     """Build the JSON data structure for the HTML template."""
     data = {
@@ -558,6 +791,16 @@ def build_report_data(sessions, date_from, date_to, project_name, project_paths)
                 "to": date_to.isoformat(),
             },
             "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "thresholds": THRESHOLDS,
+            "defaultThreshold": DEFAULT_THRESHOLD,
+            # Python-computed expected metrics per threshold. The HTML recomputes
+            # the same numbers in JS and cross-checks against these; any mismatch
+            # raises a red banner (see template.html verifyMetrics). Keys are
+            # strings because JSON object keys are always strings.
+            "expected": {
+                str(thr): compute_metrics(sessions, thr) for thr in THRESHOLDS
+            },
+            "humanGap": human_gap_histogram(sessions),
         },
         "sessions": sessions,
     }
@@ -583,7 +826,14 @@ def format_duration(minutes):
     return f"{h}h {m}m"
 
 
-def compute_active_time(timestamps, threshold_ms=15 * 60 * 1000):
+# Selectable gap thresholds (minutes) offered in the HTML report and the
+# terminal comparison table. 15 is the default — ~90% of cross-session human
+# interaction gaps fall under it (see the human-gap histogram).
+THRESHOLDS = [10, 15, 20, 30]
+DEFAULT_THRESHOLD = 15
+
+
+def compute_active_time(timestamps, threshold_ms=DEFAULT_THRESHOLD * 60 * 1000):
     """Compute active time from sorted timestamps using gap-threshold algorithm."""
     if len(timestamps) < 2:
         return 0
@@ -593,6 +843,78 @@ def compute_active_time(timestamps, threshold_ms=15 * 60 * 1000):
         if gap <= threshold_ms:
             active_ms += gap
     return active_ms / 60000  # return minutes
+
+
+def active_minutes_by_day(sessions, ts_key, threshold_min):
+    """Union each local calendar day's timestamps (field `ts_key`) across ALL
+    sessions, then sum gap-threshold active minutes per day.
+
+    `ts_key` is 'timestamps' (total active) or 'humanTimestamps' (human-online).
+    Unioning per day across sessions collapses overlapping parallel work and —
+    critically — counts the human-online metric ACROSS sessions, so switching
+    between parallel sessions is not misread as going offline. This mirrors the
+    HTML's per-day union exactly (template.html preprocessDays + render).
+    """
+    thr_ms = threshold_min * 60 * 1000
+    day_streams = {}
+    for s in sessions:
+        for t in s.get(ts_key, []) or []:
+            d = datetime.fromtimestamp(t / 1000).date()
+            day_streams.setdefault(d, []).append(t)
+    return sum(compute_active_time(sorted(v), thr_ms)
+               for v in day_streams.values())
+
+
+def compute_metrics(sessions, threshold_min):
+    """Three headline time metrics at one threshold (minutes).
+
+    ai_solo = total_active − human_online: wall-clock the project advanced while
+    the human was NOT interacting (AI running autonomously).
+    """
+    total = active_minutes_by_day(sessions, "timestamps", threshold_min)
+    human = active_minutes_by_day(sessions, "humanTimestamps", threshold_min)
+    return {"total": total, "human": human, "solo": max(total - human, 0.0)}
+
+
+def human_gap_histogram(sessions):
+    """Distribution of cross-session human-interaction gaps, for justifying the
+    default threshold. Buckets (minutes): 0-2 / 2-5 / 5-10 / 10-15 / 15-30 / >30.
+
+    Gaps are taken over the per-day union of human timestamps across sessions
+    (same basis as the human-online metric). `coverage[t]` = fraction of gaps
+    ≤ t minutes — i.e. the share of interactions the threshold t treats as
+    "still online".
+    """
+    edges = [0, 2, 5, 10, 15, 30]  # left edges; last bucket is >30
+    labels = ["0-2", "2-5", "5-10", "10-15", "15-30", ">30"]
+    counts = [0] * len(labels)
+    gaps = []
+    day_streams = {}
+    for s in sessions:
+        for t in s.get("humanTimestamps", []) or []:
+            d = datetime.fromtimestamp(t / 1000).date()
+            day_streams.setdefault(d, []).append(t)
+    for ts in day_streams.values():
+        ts.sort()
+        for i in range(1, len(ts)):
+            gaps.append((ts[i] - ts[i - 1]) / 60000.0)  # minutes
+    for g in gaps:
+        idx = len(labels) - 1
+        for i in range(len(edges) - 1):
+            if edges[i] <= g < edges[i + 1]:
+                idx = i
+                break
+        counts[idx] += 1
+    total = len(gaps)
+    coverage = {t: (sum(1 for g in gaps if g <= t) / total if total else 0.0)
+                for t in THRESHOLDS}
+    return {
+        "labels": labels,
+        "edges": edges,  # left edges; histogram x-axis is 6 equal-width bars
+        "counts": counts,
+        "total": total,
+        "coverage": coverage,
+    }
 
 
 def print_summary(data):
@@ -657,12 +979,26 @@ def print_summary(data):
     print(f"{'=' * 50}")
     print(f"  Sessions:     {total_sessions}")
     print(f"  Messages:     {total_messages}")
-    print(f"  Active time:  {format_duration(total_minutes)} (wall-clock, 15min threshold)")
+    human_default = active_minutes_by_day(sessions, "humanTimestamps", DEFAULT_THRESHOLD)
+    solo_default = max(total_minutes - human_default, 0.0)
+    print(f"  Active time:  {format_duration(total_minutes)} (wall-clock, {DEFAULT_THRESHOLD}min threshold)")
+    print(f"  Human online: {format_duration(human_default)} (you interacting)")
+    print(f"  AI autonomous:{format_duration(solo_default)} (total − human)")
     print(f"  Parallel sum: {format_duration(parallel_sum)} (per-session, overlap counted)")
     print(f"  Active days:  {len(active_days)}")
     if active_days:
         avg = total_minutes / len(active_days)
         print(f"  Daily avg:    {format_duration(avg)}")
+    print(f"{'-' * 50}")
+    # Threshold comparison: how the three metrics move as the gap threshold
+    # changes. Human-online is computed across sessions (per-day union), so
+    # switching between parallel sessions is not counted as going offline.
+    print("  Threshold     Total    Human   AI solo")
+    for thr in THRESHOLDS:
+        m = compute_metrics(sessions, thr)
+        mark = "  (default)" if thr == DEFAULT_THRESHOLD else ""
+        print(f"   {thr:>2}min    {format_duration(m['total']):>8} "
+              f"{format_duration(m['human']):>8} {format_duration(m['solo']):>8}{mark}")
     print(f"{'-' * 50}")
     print(f"  Input:        {fmt_tokens(overall['input']):>10}")
     print(f"  Output:       {fmt_tokens(overall['output']):>10}")
@@ -687,7 +1023,8 @@ def print_table(data):
         ts = sorted(s.get("timestamps", []))
         when = datetime.fromtimestamp(ts[0] / 1000).strftime("%m-%d %H:%M") if ts else "—"
         tok = s.get("tokens") or {}
-        summary = re.sub(r"\s+", " ", s.get("summary") or "").strip()
+        summary = re.sub(r"\s+", " ",
+                         s.get("aiSummary") or s.get("summary") or "").strip()
         cw = tok.get("cache_write_5m", 0) + tok.get("cache_write_1h", 0)
         rows.append({
             "when": when,
@@ -769,6 +1106,16 @@ def build_parser():
                         help="Render each in-range session into a static HTML "
                              "transcript (via claude-code-transcripts) and link "
                              "it from the Title column of the cost table.")
+    parser.add_argument("--no-ai-summary", action="store_true",
+                        help="Disable the AI one-line 'what got done' Summary "
+                             "(falls back to the first prompt). On by default; "
+                             "uses the Claude Code CLI / your subscription, cached "
+                             "per session so cost is paid once.")
+    parser.add_argument("--ai-summary-model", default="haiku",
+                        help="Model for AI summaries (default: haiku)")
+    parser.add_argument("--summaries-dir",
+                        help="Override the AI-summary cache directory "
+                             "(default: <project>/time-report-summaries)")
     parser.add_argument("--transcripts-dir",
                         help="Override the transcript output directory "
                              "(default: <project path>/time-report-transcripts).")
@@ -890,6 +1237,8 @@ def main():
         ts_in_range = [t for t in result["timestamps"] if from_ms <= t < to_ms]
         if not ts_in_range:
             continue
+        human_in_range = [t for t in result.get("human_timestamps", [])
+                          if from_ms <= t < to_ms]
 
         # Aggregate token usage for events that fall inside the range. Codex runs
         # OpenAI models, so its tokens are counted but NOT priced (cost N/A) —
@@ -908,10 +1257,12 @@ def main():
             "costNA": is_codex,  # cost not computed (OpenAI model) → render "—"
             "title": result.get("title") or "",
             "summary": result["summary"] or f"(session {external_id[:8]})",
+            "aiSummary": None,  # filled by generate_ai_summaries (default on)
             "branch": branch,
             "messageCount": msg_count or len(ts_in_range),
             "created": "",
             "timestamps": ts_in_range,
+            "humanTimestamps": human_in_range,
             "tokens": usage["tokens"],
             "cost": usage["cost"],
             "families": usage["families"],
@@ -948,6 +1299,13 @@ def main():
                                         "dateRange": {"from": str(date_from), "to": str(date_to)}},
                                "sessions": []}, indent=2))
         sys.exit(0)
+
+    # AI one-line "what got done" summaries (default on). Cached per session, so
+    # the subscription cost is paid once; degrades to the first-prompt summary if
+    # the CLI is unavailable.
+    if not args.no_ai_summary:
+        generate_ai_summaries(sessions, project_paths, args.summaries_dir, log,
+                              model=args.ai_summary_model)
 
     # Optionally render per-session transcript bundles and link them in the table
     if args.transcripts:

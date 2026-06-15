@@ -27,6 +27,18 @@
   .filter-preset { padding: 4px 12px; border-radius: 16px; border: 1px solid #ddd; background: #fff; font-size: 12px; color: #666; cursor: pointer; transition: all 0.15s; }
   .filter-preset:hover { border-color: #1a73e8; color: #1a73e8; }
   .filter-preset.active { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+  .hist-wrapper { background: #fff; border-radius: 12px; padding: 20px 28px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 16px; }
+  .hist-title { font-size: 15px; font-weight: 600; color: #333; margin-bottom: 16px; }
+  .hist-chart { position: relative; display: flex; align-items: flex-end; gap: 10px; height: 160px; padding: 0 8px 24px; border-bottom: 1px solid #eee; }
+  .hist-bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; position: relative; }
+  .hist-bar { width: 100%; max-width: 64px; background: #4285f4; border-radius: 4px 4px 0 0; transition: background 0.15s; min-height: 2px; }
+  .hist-bar.over { background: #dadce0; }
+  .hist-bar-count { font-size: 12px; color: #666; margin-bottom: 4px; font-variant-numeric: tabular-nums; }
+  .hist-bar-label { position: absolute; bottom: -22px; font-size: 11px; color: #888; white-space: nowrap; }
+  .hist-threshold-line { position: absolute; top: 0; bottom: 24px; width: 2px; background: #d93025; z-index: 3; pointer-events: none; }
+  .hist-threshold-line::after { content: attr(data-label); position: absolute; top: -2px; left: 5px; font-size: 11px; color: #d93025; font-weight: 600; white-space: nowrap; }
+  .hist-caption { font-size: 13px; color: #555; margin-top: 20px; line-height: 1.6; }
+  .hist-caption b { color: #d93025; }
 
   .gantt-wrapper { background: #fff; border-radius: 12px; padding: 28px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 24px; }
   .gantt-title { font-size: 16px; font-weight: 600; margin-bottom: 20px; }
@@ -112,7 +124,7 @@
   .cost-pager button:hover:not(:disabled) { border-color: #1a73e8; color: #1a73e8; }
   .cost-pager button:disabled { opacity: 0.4; cursor: default; }
   .cost-table td { font-size: 12.5px; padding: 8px 12px; border-bottom: 1px solid #f5f5f5; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .cost-table td.desc { text-align: left; color: #444; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cost-table td.desc { text-align: left; color: #444; max-width: 360px; min-width: 220px; white-space: normal; overflow-wrap: anywhere; word-break: break-word; line-height: 1.45; }
   .cost-table td.title { text-align: left; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .cost-table td.title a { color: #1a73e8; text-decoration: none; }
   .cost-table td.title a:hover { text-decoration: underline; }
@@ -126,6 +138,7 @@
 </head>
 <body>
 <div class="container">
+  <div id="verify-banner" style="display:none;background:#fdeded;border:1px solid #d93025;color:#a50e0e;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;line-height:1.6;"></div>
   <h1 id="title">Claude Code Time Report</h1>
   <p class="subtitle" id="subtitle"></p>
 
@@ -134,6 +147,16 @@
       <div class="label">Active Time (wall-clock)</div>
       <div class="value" id="stat-total"></div>
       <div class="sub">并行会话已去重,≤ 当天时长</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Human Online</div>
+      <div class="value" id="stat-human" style="color:#34a853;"></div>
+      <div class="sub">你在互动的时间(跨会话)</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">AI Autonomous</div>
+      <div class="value" id="stat-ai" style="color:#9c27b0;"></div>
+      <div class="sub">总 − 人在线(AI 自主运行)</div>
     </div>
     <div class="stat-card">
       <div class="label">Time Span (first→last)</div>
@@ -164,19 +187,16 @@
 
   <div class="filter-bar">
     <span class="filter-label">Gap Threshold:</span>
-    <div class="filter-slider-wrap">
-      <input type="range" class="filter-slider" id="threshold-slider" min="1" max="60" value="15">
-      <div class="filter-value" id="threshold-display"></div>
+    <div class="filter-presets" id="presets"></div>
+    <span class="filter-value" id="threshold-display"></span>
+  </div>
+
+  <div class="hist-wrapper">
+    <div class="hist-title">真人互动间隔分布
+      <span style="font-size:12px;color:#aaa;font-weight:400;margin-left:8px;">说明默认阈值的合理性 · 跨会话(发消息 + 文字确认)</span>
     </div>
-    <div class="filter-presets" id="presets">
-      <button class="filter-preset" data-val="5">5m</button>
-      <button class="filter-preset" data-val="10">10m</button>
-      <button class="filter-preset active" data-val="15">15m</button>
-      <button class="filter-preset" data-val="20">20m</button>
-      <button class="filter-preset" data-val="30">30m</button>
-      <button class="filter-preset" data-val="45">45m</button>
-      <button class="filter-preset" data-val="60">60m</button>
-    </div>
+    <div class="hist-chart" id="hist-chart"></div>
+    <div class="hist-caption" id="hist-caption"></div>
   </div>
 
   <div class="gantt-wrapper">
@@ -361,7 +381,7 @@ function buildCostRows() {
         when: String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0') + ' ' + formatTsTime(start),
         title: s.title || s.summary || ('session ' + s.id.slice(0, 8)),
         transcript: s.transcript || null,
-        desc: s.summary || ('(session ' + s.id.slice(0, 8) + ')'),
+        desc: s.aiSummary || s.summary || ('(session ' + s.id.slice(0, 8) + ')'),
         msgs: s.messageCount || 0,
         input, output, cw, cr,
         total: input + output + cw + cr,
@@ -473,18 +493,38 @@ function preprocessDays(thresholdMs) {
 
   DATA.sessions.forEach((s, sIdx) => {
     if (!s.timestamps || s.timestamps.length === 0) return;
-    const sorted = [...s.timestamps].sort((a, b) => a - b);
-    const dateKey = getLocalDateStr(sorted[0]);
-
-    if (!dayMap.has(dateKey)) dayMap.set(dateKey, []);
-    dayMap.get(dateKey).push({
-      id: s.id,
-      desc: s.summary || '(session ' + s.id.slice(0, 8) + ')',
-      branch: s.branch || '',
-      messageCount: s.messageCount || 0,
-      timestamps: sorted,
-      globalIdx: sIdx,
-    });
+    // Bucket each timestamp by its OWN local date, so a cross-midnight session
+    // contributes a slice to BOTH days. This mirrors Python's per-timestamp day
+    // bucketing (active_minutes_by_day). The previous code keyed the whole
+    // session by its first timestamp's date, which stranded the post-midnight
+    // tail (the next day's slice never appeared) and undercounted active time —
+    // ~8.6h on a real month. humanTimestamps are bucketed the same way.
+    const byDay = new Map(); // dateKey -> { ts:[], human:[] }
+    for (const t of s.timestamps) {
+      const k = getLocalDateStr(t);
+      if (!byDay.has(k)) byDay.set(k, { ts: [], human: [] });
+      byDay.get(k).ts.push(t);
+    }
+    for (const t of (s.humanTimestamps || [])) {
+      const k = getLocalDateStr(t);
+      if (!byDay.has(k)) byDay.set(k, { ts: [], human: [] });
+      byDay.get(k).human.push(t);
+    }
+    for (const [dateKey, v] of byDay) {
+      if (v.ts.length === 0) continue;
+      v.ts.sort((a, b) => a - b);
+      v.human.sort((a, b) => a - b);
+      if (!dayMap.has(dateKey)) dayMap.set(dateKey, []);
+      dayMap.get(dateKey).push({
+        id: s.id,
+        desc: s.aiSummary || s.summary || '(session ' + s.id.slice(0, 8) + ')',
+        branch: s.branch || '',
+        messageCount: s.messageCount || 0,
+        timestamps: v.ts,
+        humanTimestamps: v.human,
+        globalIdx: sIdx,
+      });
+    }
   });
 
   // Sort days and fill inactive gaps
@@ -535,7 +575,7 @@ function render(threshold) {
   const PROP_START = COMPRESS_HOUR * 60;
   const PROP_END = Math.max(propEnd, PROP_START + 60);
 
-  let totalActiveUnion = 0, totalWindow = 0, totalParallelSum = 0;
+  let totalActiveUnion = 0, totalWindow = 0, totalParallelSum = 0, totalHumanOnline = 0;
   const dayResults = [];
 
   days.forEach(day => {
@@ -548,11 +588,13 @@ function render(threshold) {
     const sessionData = [];
 
     day.sessions.forEach(s => {
-      // Filter timestamps to this calendar day
+      // Filter timestamps to this calendar day (already day-sliced in
+      // preprocessDays; filter is an idempotent safety net).
       const dayTs = s.timestamps.filter(t => t >= dayStart && t < dayEnd);
       if (dayTs.length === 0) return;
+      const dayHuman = (s.humanTimestamps || []).filter(t => t >= dayStart && t < dayEnd);
       const result = computeActiveSpans(dayTs, thresholdMs);
-      sessionData.push({ ...s, timestamps: dayTs, ...result });
+      sessionData.push({ ...s, timestamps: dayTs, humanTimestamps: dayHuman, ...result });
     });
 
     // Active time = UNION across all sessions. Sessions run in parallel, so
@@ -562,6 +604,13 @@ function render(threshold) {
     const combinedTs = [];
     sessionData.forEach(s => { for (const t of s.timestamps) combinedTs.push(t); });
     const dayActiveUnion = computeActiveSpans(combinedTs, thresholdMs).activeMinutes;
+
+    // Human-online = same union but over human timestamps only, ACROSS sessions
+    // \u2014 so switching between parallel sessions is not misread as offline.
+    const combinedHuman = [];
+    sessionData.forEach(s => { for (const t of (s.humanTimestamps || [])) combinedHuman.push(t); });
+    const dayHumanUnion = computeActiveSpans(combinedHuman, thresholdMs).activeMinutes;
+    totalHumanOnline += dayHumanUnion;
 
     // Parallel sum = naive per-session total (can exceed 24h with concurrency)
     let dayParallelSum = 0;
@@ -582,9 +631,14 @@ function render(threshold) {
   });
 
   // Stats
+  const aiSolo = Math.max(totalActiveUnion - totalHumanOnline, 0);
   document.getElementById('stat-total').innerHTML = formatDurHTML(totalActiveUnion);
+  document.getElementById('stat-human').innerHTML = formatDurHTML(totalHumanOnline);
+  document.getElementById('stat-ai').innerHTML = formatDurHTML(aiSolo);
   document.getElementById('stat-session-time').innerHTML = formatDurHTML(totalWindow);
   document.getElementById('stat-gap-time').innerHTML = formatDurHTML(totalParallelSum);
+  verifyMetrics(threshold, totalActiveUnion, totalHumanOnline, aiSolo);
+  renderHistogram(threshold);
   const activeDays = days.filter(d => !d.inactive && d.sessions.length > 0).length;
   document.getElementById('stat-parallel-sub').textContent =
     '\u5404\u4f1a\u8bdd\u65f6\u957f\u76f8\u52a0(\u542b\u91cd\u53e0)\u00b7 ' + activeDays + ' \u6d3b\u8dc3\u5929';
@@ -825,17 +879,103 @@ function render(threshold) {
   });
 }
 
+// ========== PYTHON\u2194JS CROSS-CHECK ==========
+// Python embeds expected metrics per threshold (meta.expected). We recompute
+// them in JS (totalActiveUnion / totalHumanOnline / aiSolo) and compare. A
+// mismatch means the two independent implementations diverged \u2014 e.g. a
+// day-bucketing regression \u2014 and the numbers must NOT be trusted silently.
+function verifyMetrics(threshold, total, human, solo) {
+  const banner = document.getElementById('verify-banner');
+  const exp = DATA.meta && DATA.meta.expected && DATA.meta.expected[String(threshold)];
+  if (!exp) { banner.style.display = 'none'; return; }
+  const TOL = 1; // minutes \u2014 rounding tolerance between the two implementations
+  const checks = [
+    ['Total active', total, exp.total],
+    ['Human online', human, exp.human],
+    ['AI autonomous', solo, exp.solo],
+  ];
+  const bad = checks.filter(([, js, py]) => Math.abs(js - py) > TOL);
+  if (bad.length === 0) { banner.style.display = 'none'; return; }
+  banner.style.display = 'block';
+  banner.innerHTML = '\u26a0 <b>\u6821\u9a8c\u5931\u8d25</b>\uff1aPython \u4e0e\u7f51\u9875\u7b97\u51fa\u7684\u6307\u6807\u4e0d\u4e00\u81f4\uff08\u9608\u503c ' +
+    threshold + 'min\uff09\u3002\u6570\u636e\u53ef\u80fd\u4e0d\u53ef\u4fe1\u3002<br>' +
+    bad.map(([name, js, py]) => '\u00b7 ' + name + '\uff1aPython=' + py.toFixed(1) +
+      'm\uff0c\u7f51\u9875=' + js.toFixed(1) + 'm\uff08\u5dee ' + Math.abs(js - py).toFixed(1) + 'm\uff09').join('<br>');
+}
+
+// ========== HUMAN-INTERACTION GAP HISTOGRAM ==========
+// Distribution of cross-session human-interaction gaps (Python: humanGap).
+// Bars are static; the red line marks the current threshold and the caption
+// reports how much of the distribution that threshold treats as "still online".
+function renderHistogram(threshold) {
+  const hg = DATA.meta && DATA.meta.humanGap;
+  const chart = document.getElementById('hist-chart');
+  const caption = document.getElementById('hist-caption');
+  if (!hg || !hg.total) {
+    chart.innerHTML = '<div style="color:#aaa;font-size:13px;">\u65e0\u8db3\u591f\u7684\u771f\u4eba\u4e92\u52a8\u6570\u636e</div>';
+    caption.textContent = '';
+    return;
+  }
+  const maxCount = Math.max(...hg.counts, 1);
+  chart.innerHTML = hg.counts.map((c, i) => {
+    const h = (c / maxCount) * 100;
+    const over = hg.edges[i] >= threshold; // whole bucket lies beyond threshold
+    return '<div class="hist-bar-wrap">' +
+      '<div class="hist-bar-count">' + c + '</div>' +
+      '<div class="hist-bar' + (over ? ' over' : '') + '" style="height:' + h + '%;"></div>' +
+      '<div class="hist-bar-label">' + hg.labels[i] + 'm</div>' +
+      '</div>';
+  }).join('');
+  const x = thresholdToPercent(threshold, hg.edges);
+  if (x !== null) {
+    const line = document.createElement('div');
+    line.className = 'hist-threshold-line';
+    line.style.left = 'calc(8px + (100% - 16px) * ' + x + ')';
+    line.setAttribute('data-label', threshold + 'm');
+    chart.appendChild(line);
+  }
+  const cov = hg.coverage && hg.coverage[String(threshold)];
+  if (cov != null) {
+    caption.innerHTML = '\u9608\u503c <b>' + threshold + ' \u5206\u949f</b>\uff1a<b>' +
+      (cov * 100).toFixed(0) + '%</b> \u7684\u771f\u4eba\u4e92\u52a8\u95f4\u9694\u843d\u5728\u7ea2\u7ebf\u5de6\u4fa7\uff08\u2264 ' +
+      threshold + 'm\uff09\uff0c\u88ab\u5f53\u4f5c\u201c\u8fde\u7eed\u5728\u7ebf\u201d\uff1b\u53ea\u6709\u66f4\u957f\u7684\u95f4\u9694\u624d\u7b97\u79bb\u5f00\u3002' +
+      '\u8fd9\u8bf4\u660e ' + threshold + 'm \u8db3\u4ee5\u8986\u76d6\u7edd\u5927\u591a\u6570\u771f\u5b9e\u4e92\u52a8\u8282\u594f\u3002';
+  } else {
+    caption.textContent = '';
+  }
+}
+
+// Map a threshold (minutes) to a 0..1 x position across 6 equal-width buckets
+// whose left edges are `edges` (last bucket open-ended). Within a bucket we
+// interpolate linearly by minutes so e.g. 20m lands inside the 15-30 bar.
+function thresholdToPercent(threshold, edges) {
+  const n = edges.length; // 6
+  for (let i = 0; i < n - 1; i++) {
+    if (threshold >= edges[i] && threshold <= edges[i + 1]) {
+      const frac = (threshold - edges[i]) / (edges[i + 1] - edges[i]);
+      return (i + frac) / n;
+    }
+  }
+  if (threshold > edges[n - 1]) return (n - 0.5) / n; // inside open-ended last bucket
+  return null;
+}
+
 // ========== INIT ==========
 document.getElementById('title').textContent = DATA.meta.project + ' \u2014 Time Report';
 document.getElementById('footer').textContent = 'Generated by Claude Code \u00b7 ' +
   new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(DATA.meta.generatedAt));
 
-const slider = document.getElementById('threshold-slider');
 const display = document.getElementById('threshold-display');
 const presets = document.getElementById('presets');
 
+// Build the threshold buttons from the Python-provided list, so the terminal
+// and the page always offer the same set of thresholds.
+const THRESHOLDS = (DATA.meta && DATA.meta.thresholds) || [10, 15, 20, 30];
+const DEFAULT_THRESHOLD = (DATA.meta && DATA.meta.defaultThreshold) || 15;
+presets.innerHTML = THRESHOLDS.map(t =>
+  '<button class="filter-preset" data-val="' + t + '">' + t + 'm</button>').join('');
+
 function updateThreshold(val) {
-  slider.value = val;
   display.innerHTML = val + '<span style="font-size:12px;font-weight:400;color:#666;"> min</span>';
   presets.querySelectorAll('.filter-preset').forEach(btn => {
     btn.classList.toggle('active', parseInt(btn.dataset.val) === val);
@@ -843,12 +983,11 @@ function updateThreshold(val) {
   render(val);
 }
 
-slider.addEventListener('input', () => updateThreshold(parseInt(slider.value)));
 presets.querySelectorAll('.filter-preset').forEach(btn => {
   btn.addEventListener('click', () => updateThreshold(parseInt(btn.dataset.val)));
 });
 
-updateThreshold(15);
+updateThreshold(DEFAULT_THRESHOLD);
 renderCost();
 </script>
 </body>
