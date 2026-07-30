@@ -11,7 +11,7 @@
       "name": "time-report",
       "source": "./.",
       "description": "Interactive HTML Gantt + token/cost report for Claude Code & Codex sessions",
-      "version": "3.4.0",
+      "version": "3.6.0",
       "author": {
         "name": "pierrelzw"
       },

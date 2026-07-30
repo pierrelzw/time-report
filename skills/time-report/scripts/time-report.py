@@ -238,6 +238,18 @@ def extract_timestamps(jsonl_path):
         token_events: list of {"ts", "family", <TOKEN_KEYS>} — one per
             assistant message that carried a usage block. Filtered to the
             report's date range later by the caller.
+
+    Human signals come from two places (see HUMAN_ACTIONS.md for the full
+    per-record-type classification):
+      1. `type=="user"` records that pass _is_human_turn() — typed prompts,
+         short confirmations, slash commands.
+      2. Out-of-band records that only exist for human actions and would
+         otherwise be dropped by the user/assistant filter below —
+         queued prompts, AskUserQuestion answers, slash commands, plan
+         approvals. See _human_side_channel().
+    Every human timestamp is ALSO an activity timestamp: a human action is by
+    definition activity, and letting `human` exceed `timestamps` would make
+    compute_metrics' `total - human` clamp to zero.
     """
     timestamps = []
     human_timestamps = []  # subset: timestamps of real human turns (see _is_human_turn)
@@ -245,6 +257,12 @@ def extract_timestamps(jsonl_path):
     summary = None
     title = None  # latest Claude Code auto-generated session title (ai-title record)
     skipped = 0
+    # tool_use ids of AskUserQuestion calls seen so far. The answer arrives
+    # later as a `tool_result` in a user record; Claude Code gives it the same
+    # shape as real tool output, so the id is the only way to tell "the human
+    # picked an option" from "a tool returned data". Single pass is safe: a
+    # tool_use always precedes its tool_result in the file.
+    ask_ids = set()
 
     try:
         with open(jsonl_path, encoding="utf-8", errors="replace") as f:
@@ -268,6 +286,14 @@ def extract_timestamps(jsonl_path):
                         title = at.strip()
                     continue
 
+                # Human actions recorded OUTSIDE the user/assistant stream.
+                # Checked before the filter below, which would drop them.
+                side_ts = _human_side_channel(record, rec_type)
+                if side_ts is not None:
+                    timestamps.append(side_ts)
+                    human_timestamps.append(side_ts)
+                    continue
+
                 if rec_type not in ("user", "assistant"):
                     continue
 
@@ -281,6 +307,7 @@ def extract_timestamps(jsonl_path):
                     ev = _parse_usage(record, ts_ms)
                     if ev:
                         token_events.append(ev)
+                    ask_ids.update(_ask_user_question_ids(record))
 
                 if rec_type == "user":
                     msg = record.get("message", {})
@@ -289,7 +316,14 @@ def extract_timestamps(jsonl_path):
                     # command — NOT a tool_result (content is a list of tool_result
                     # blocks) and NOT a system-injected meta record. This is the
                     # signal for "human online" time. See _is_human_turn.
-                    if _is_human_turn(record, content) and ts_ms:
+                    #
+                    # Exception: a tool_result answering an AskUserQuestion IS the
+                    # human (they picked an option). _is_human_turn can't see that
+                    # — it only gets the message shape — so it's checked here where
+                    # ask_ids is in scope.
+                    if ts_ms and _answers_ask_user_question(content, ask_ids):
+                        human_timestamps.append(ts_ms)
+                    elif _is_human_turn(record, content) and ts_ms:
                         human_timestamps.append(ts_ms)
                         # Summary = first human turn's text (was: first non-meta user)
                         if summary is None:
@@ -322,6 +356,77 @@ def _first_text_block(content):
                 if t:
                     return t
     return ""
+
+
+def _ask_user_question_ids(record):
+    """tool_use ids of AskUserQuestion calls in one assistant record."""
+    content = (record.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return ()
+    return tuple(
+        b.get("id") for b in content
+        if isinstance(b, dict) and b.get("type") == "tool_use"
+        and b.get("name") == "AskUserQuestion" and b.get("id")
+    )
+
+
+def _answers_ask_user_question(content, ask_ids):
+    """True if this user content is the human's answer to an AskUserQuestion.
+
+    Claude Code feeds the chosen options back as an ordinary `tool_result`
+    block, indistinguishable by shape from real tool output — matching
+    `tool_use_id` against the AskUserQuestion calls seen so far is the only
+    reliable discriminator.
+    """
+    if not ask_ids or not isinstance(content, list):
+        return False
+    return any(
+        isinstance(b, dict) and b.get("type") == "tool_result"
+        and b.get("tool_use_id") in ask_ids
+        for b in content
+    )
+
+
+def _human_side_channel(record, rec_type):
+    """Timestamp of a human action recorded outside the user/assistant stream.
+
+    Returns epoch ms, or None if this record is not such an action. Every case
+    here is a keystroke the human made that leaves no `type=="user"` record at
+    the moment it happened:
+
+      queue-operation/enqueue      — prompt typed while the AI was still working
+      attachment/queued_command    — same act, second record shape (newer CLI);
+                                     duplicate timestamps are harmless (a
+                                     zero-length gap adds zero minutes)
+      attachment/plan_mode_exit    — the human approved a plan
+      system/local_command         — a slash command the human ran
+
+    Deliberately NOT counted (verified against real sessions):
+      attachment/file              — @-referenced file; always adjacent to a
+                                     typed prompt, so zero new anchors
+      mode / permission-mode       — state snapshots, carry no timestamp at all
+      system/away_summary          — recap generated BECAUSE the human left;
+                                     evidence of absence, not presence
+      everything else              — see HUMAN_ACTIONS.md
+    """
+    if rec_type == "queue-operation":
+        if record.get("operation") == "enqueue" and record.get("content"):
+            return parse_iso_timestamp(record.get("timestamp"))
+        return None
+    if rec_type == "attachment":
+        att = record.get("attachment")
+        if isinstance(att, dict) and att.get("type") in ("queued_command",
+                                                         "plan_mode_exit"):
+            return parse_iso_timestamp(record.get("timestamp"))
+        return None
+    if rec_type == "system" and record.get("subtype") == "local_command":
+        # local_command is written twice per command: once for the invocation
+        # (<command-name>) and once for its stdout. Only the invocation is the
+        # human's keystroke.
+        if "<command-name>" in (record.get("content") or ""):
+            return parse_iso_timestamp(record.get("timestamp"))
+        return None
+    return None
 
 
 def _is_human_turn(record, content):
@@ -780,7 +885,8 @@ def generate_ai_summaries(sessions, project_paths, override, log,
     return base
 
 
-def build_report_data(sessions, date_from, date_to, project_name, project_paths):
+def build_report_data(sessions, date_from, date_to, project_name, project_paths,
+                      show_human_ai=False):
     """Build the JSON data structure for the HTML template."""
     data = {
         "meta": {
@@ -801,6 +907,9 @@ def build_report_data(sessions, date_from, date_to, project_name, project_paths)
                 str(thr): compute_metrics(sessions, thr) for thr in THRESHOLDS
             },
             "humanGap": human_gap_histogram(sessions),
+            # Human/AI 拆分（Human Online / AI Autonomous 卡片 + 互动间隔直方图）
+            # 默认收起；--show-human-ai 时初始展开。HTML 里始终可手动展开。
+            "showHumanAI": show_human_ai,
         },
         "sessions": sessions,
     }
@@ -917,7 +1026,7 @@ def human_gap_histogram(sessions):
     }
 
 
-def print_summary(data):
+def print_summary(data, show_human_ai=False):
     """Print text summary to terminal."""
     meta = data["meta"]
     sessions = data["sessions"]
@@ -979,26 +1088,34 @@ def print_summary(data):
     print(f"{'=' * 50}")
     print(f"  Sessions:     {total_sessions}")
     print(f"  Messages:     {total_messages}")
-    human_default = active_minutes_by_day(sessions, "humanTimestamps", DEFAULT_THRESHOLD)
-    solo_default = max(total_minutes - human_default, 0.0)
     print(f"  Active time:  {format_duration(total_minutes)} (wall-clock, {DEFAULT_THRESHOLD}min threshold)")
-    print(f"  Human online: {format_duration(human_default)} (you interacting)")
-    print(f"  AI autonomous:{format_duration(solo_default)} (total − human)")
+    if show_human_ai:
+        human_default = active_minutes_by_day(sessions, "humanTimestamps", DEFAULT_THRESHOLD)
+        solo_default = max(total_minutes - human_default, 0.0)
+        print(f"  Human online: {format_duration(human_default)} (you interacting)")
+        print(f"  AI autonomous:{format_duration(solo_default)} (total − human)")
     print(f"  Parallel sum: {format_duration(parallel_sum)} (per-session, overlap counted)")
     print(f"  Active days:  {len(active_days)}")
     if active_days:
         avg = total_minutes / len(active_days)
         print(f"  Daily avg:    {format_duration(avg)}")
     print(f"{'-' * 50}")
-    # Threshold comparison: how the three metrics move as the gap threshold
-    # changes. Human-online is computed across sessions (per-day union), so
-    # switching between parallel sessions is not counted as going offline.
-    print("  Threshold     Total    Human   AI solo")
+    # Threshold comparison: how the metrics move as the gap threshold changes.
+    # Human-online is computed across sessions (per-day union), so switching
+    # between parallel sessions is not counted as going offline. The Human /
+    # AI-solo split columns are hidden unless --show-human-ai.
+    if show_human_ai:
+        print("  Threshold     Total    Human   AI solo")
+    else:
+        print("  Threshold     Total")
     for thr in THRESHOLDS:
         m = compute_metrics(sessions, thr)
         mark = "  (default)" if thr == DEFAULT_THRESHOLD else ""
-        print(f"   {thr:>2}min    {format_duration(m['total']):>8} "
-              f"{format_duration(m['human']):>8} {format_duration(m['solo']):>8}{mark}")
+        if show_human_ai:
+            print(f"   {thr:>2}min    {format_duration(m['total']):>8} "
+                  f"{format_duration(m['human']):>8} {format_duration(m['solo']):>8}{mark}")
+        else:
+            print(f"   {thr:>2}min    {format_duration(m['total']):>8}{mark}")
     print(f"{'-' * 50}")
     print(f"  Input:        {fmt_tokens(overall['input']):>10}")
     print(f"  Output:       {fmt_tokens(overall['output']):>10}")
@@ -1102,6 +1219,11 @@ def build_parser():
     parser.add_argument("--open", action="store_true", default=True,
                         help="Auto-open report in browser (default)")
     parser.add_argument("--no-open", action="store_true", help="Don't auto-open report")
+    parser.add_argument("--show-human-ai", action="store_true",
+                        help="Show the Human Online / AI Autonomous split "
+                             "(terminal lines + threshold columns; HTML cards "
+                             "and interaction-gap histogram start expanded). "
+                             "Hidden/collapsed by default.")
     parser.add_argument("--transcripts", action="store_true",
                         help="Render each in-range session into a static HTML "
                              "transcript (via claude-code-transcripts) and link "
@@ -1313,7 +1435,8 @@ def main():
 
     # Build report data
     project_display = _get_project_name(project_paths[0]) if project_paths else project_keyword
-    report_data = build_report_data(sessions, date_from, date_to, project_display, project_paths)
+    report_data = build_report_data(sessions, date_from, date_to, project_display, project_paths,
+                                    show_human_ai=args.show_human_ai)
 
     # JSON output mode
     if args.json:
@@ -1339,7 +1462,7 @@ def main():
     print(f"Report saved to: {output_path}")
 
     # Print summary + per-session table report
-    print_summary(report_data)
+    print_summary(report_data, show_human_ai=args.show_human_ai)
     print_table(report_data)
 
     # Auto-open
