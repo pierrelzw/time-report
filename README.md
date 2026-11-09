@@ -43,6 +43,10 @@ The terminal also prints a text summary and a per-session table.
 - Sessions are deduped by `external_id`, so a session that ran in a git worktree
   under the repo (registered under both the repo path and the worktree path) is
   counted once.
+- Older Codex transcripts are `.jsonl.zst`; reading them needs a zstd decoder:
+  Python 3.14+ stdlib, the `zstandard` module, or the `zstd` CLI (otherwise they
+  are skipped with a single WARN: `pip install zstandard` / `brew install zstd`).
+  `--transcripts` pages are not generated for `.zst` sessions.
 
 ## Cost methodology
 
