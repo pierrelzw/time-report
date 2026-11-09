@@ -17,6 +17,8 @@ Usage:
 import argparse
 import calendar
 import concurrent.futures
+import contextlib
+import io
 import json
 import os
 import re
@@ -140,6 +142,71 @@ _CODEX_UUID_RE = re.compile(
 )
 
 
+# Codex compresses older transcripts to *.jsonl.zst. stdlib-only is a hard
+# requirement, so zstd support is best-effort via whatever decoder is present.
+class ZstdUnavailable(OSError):
+    """No zstd decoder available for a .jsonl.zst transcript."""
+
+
+_ZST_SKIPPED = []  # .zst paths we could not decode (for one aggregated WARN)
+
+
+@contextlib.contextmanager
+def _zstd_text_stream(path):
+    """Yield a text stream over a .zst file, trying decoders in order:
+    stdlib compression.zstd (3.14+) -> `zstandard` module -> `zstd -dc`."""
+    try:
+        from compression import zstd as _zstd  # Python 3.14+
+    except ImportError:
+        _zstd = None
+    if _zstd is not None:
+        with _zstd.open(path, "rt", encoding="utf-8", errors="replace") as f:
+            yield f
+        return
+    try:
+        import zstandard
+    except ImportError:
+        zstandard = None
+    if zstandard is not None:
+        with open(path, "rb") as raw:
+            reader = zstandard.ZstdDecompressor().stream_reader(raw)
+            yield io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+        return
+    exe = shutil.which("zstd")
+    if exe:
+        proc = subprocess.Popen([exe, "-dc", "--", str(path)],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            yield io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace")
+        finally:
+            proc.stdout.close()
+            proc.wait()
+        return
+    _ZST_SKIPPED.append(str(path))
+    raise ZstdUnavailable(f"no zstd decoder for {path}")
+
+
+def _open_text(path):
+    """Open a transcript as a text stream (context manager).
+
+    .jsonl opens normally; .jsonl.zst is decompressed on the fly. Raises
+    ZstdUnavailable (an OSError, which every caller already tolerates) when no
+    decoder exists, so one undecodable file never crashes the report.
+    """
+    if str(path).endswith(".zst"):
+        return _zstd_text_stream(path)
+    return open(path, encoding="utf-8", errors="replace")
+
+
+def _warn_zst_skipped():
+    if not _ZST_SKIPPED:
+        return
+    print(f"  WARN: skipped {len(set(_ZST_SKIPPED))} compressed Codex transcript(s) "
+          "(.jsonl.zst): no zstd decoder found. Enable with `pip install "
+          "zstandard` (or `uv run --with zstandard ...`), `brew install zstd`, "
+          "or run on Python 3.14+.", file=sys.stderr)
+
+
 def _build_codex_index():
     """Scan ~/.codex/{sessions,archived_sessions} → session_id → JSONL path.
 
@@ -154,10 +221,17 @@ def _build_codex_index():
         base = CODEX_DIR / sub
         if not base.exists():
             continue
-        for jsonl_file in base.rglob("*.jsonl"):
-            m = _CODEX_UUID_RE.search(jsonl_file.stem)
-            if m:
-                index[m.group(1)] = str(jsonl_file)
+        for jsonl_file in sorted(base.rglob("*.jsonl")) + sorted(base.rglob("*.jsonl.zst")):
+            name = jsonl_file.name
+            is_zst = name.endswith(".zst")
+            stem = name[:-len(".jsonl.zst")] if is_zst else name[:-len(".jsonl")]
+            m = _CODEX_UUID_RE.search(stem)
+            if not m:
+                continue
+            # plain .jsonl wins over .jsonl.zst for the same uuid
+            if is_zst and m.group(1) in index:
+                continue
+            index[m.group(1)] = str(jsonl_file)
     return index
 
 
@@ -265,7 +339,7 @@ def extract_timestamps(jsonl_path):
     ask_ids = set()
 
     try:
-        with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+        with _open_text(jsonl_path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -534,7 +608,7 @@ def extract_codex_timestamps(jsonl_path):
     skipped = 0
 
     try:
-        with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+        with _open_text(jsonl_path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -667,7 +741,14 @@ def generate_transcripts(sessions, project_paths, override, log):
     base.mkdir(parents=True, exist_ok=True)
     log(f"Transcripts → {base}")
 
-    targets = [s for s in sessions if s.get("jsonlPath")]
+    # claude-code-transcripts reads the path directly and can't take .zst;
+    # skip compressed Codex sessions rather than failing them one by one.
+    zst = [s for s in sessions if str(s.get("jsonlPath", "")).endswith(".zst")]
+    if zst:
+        log(f"  WARN: skipping transcript pages for {len(zst)} compressed "
+            "(.jsonl.zst) Codex session(s); decompress them to enable.")
+    targets = [s for s in sessions
+               if s.get("jsonlPath") and not str(s["jsonlPath"]).endswith(".zst")]
 
     def _one(s):
         out = base / (s.get("fullId") or s["id"])
@@ -739,7 +820,7 @@ def _extract_digest_text(jsonl_path, is_codex, max_chars=12000):
     """
     parts = []
     try:
-        with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+        with _open_text(jsonl_path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -1352,7 +1433,8 @@ def main():
         result = (extract_codex_timestamps(jsonl_path) if is_codex
                   else extract_timestamps(jsonl_path))
         if not result["timestamps"]:
-            empty_jsonl += 1
+            if str(jsonl_path) not in _ZST_SKIPPED:  # undecodable .zst: WARNed separately
+                empty_jsonl += 1
             continue
 
         # Filter timestamps to date range
@@ -1393,6 +1475,8 @@ def main():
         })
 
     log(f"Sessions with data: {len(sessions)}")
+
+    _warn_zst_skipped()
 
     # Always surface unreadable sessions, even when others were read — otherwise
     # a silently-dropped subset (e.g. Codex sessions whose transcript is gone)
